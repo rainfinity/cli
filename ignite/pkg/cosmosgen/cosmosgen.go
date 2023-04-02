@@ -2,60 +2,73 @@ package cosmosgen
 
 import (
 	"context"
+	"path/filepath"
+	"strings"
 
-	gomodmodule "golang.org/x/mod/module"
+	"github.com/iancoleman/strcase"
+	gomodule "golang.org/x/mod/module"
 
-	"github.com/ignite-hq/cli/ignite/pkg/cosmosanalysis/module"
+	"github.com/ignite/cli/ignite/pkg/cache"
+	"github.com/ignite/cli/ignite/pkg/cosmosanalysis/module"
 )
 
 // generateOptions used to configure code generation.
 type generateOptions struct {
 	includeDirs []string
 	gomodPath   string
+	useCache    bool
 
-	jsOut               func(module.Module) string
-	jsIncludeThirdParty bool
-	vuexStoreRootPath   string
+	jsOut            func(module.Module) string
+	tsClientRootPath string
+
+	vuexOut      func(module.Module) string
+	vuexRootPath string
+
+	composablesOut      func(module.Module) string
+	composablesRootPath string
+
+	hooksOut      func(module.Module) string
+	hooksRootPath string
 
 	specOut string
-
-	dartOut               func(module.Module) string
-	dartIncludeThirdParty bool
-	dartRootPath          string
 }
 
 // TODO add WithInstall.
 
+// ModulePathFunc defines a function type that returns a path based on a Cosmos SDK module.
+type ModulePathFunc func(module.Module) string
+
 // Option configures code generation.
 type Option func(*generateOptions)
 
-// WithJSGeneration adds JS code generation. out hook is called for each module to
-// retrieve the path that should be used to place generated js code inside for a given module.
-// if includeThirdPartyModules set to true, code generation will be made for the 3rd party modules
-// used by the app -including the SDK- as well.
-func WithJSGeneration(includeThirdPartyModules bool, out func(module.Module) (path string)) Option {
+// WithTSClientGeneration adds Typescript Client code generation.
+// The tsClientRootPath is used to determine the root path of generated Typescript classes.
+func WithTSClientGeneration(out ModulePathFunc, tsClientRootPath string, useCache bool) Option {
 	return func(o *generateOptions) {
 		o.jsOut = out
-		o.jsIncludeThirdParty = includeThirdPartyModules
+		o.tsClientRootPath = tsClientRootPath
+		o.useCache = useCache
 	}
 }
 
-// WithVuexGeneration adds Vuex code generation. storeRootPath is used to determine the root path of generated
-// Vuex stores. includeThirdPartyModules and out configures the underlying JS lib generation which is
-// documented in WithJSGeneration.
-func WithVuexGeneration(includeThirdPartyModules bool, out func(module.Module) (path string), storeRootPath string) Option {
+func WithVuexGeneration(out ModulePathFunc, vuexRootPath string) Option {
 	return func(o *generateOptions) {
-		o.jsOut = out
-		o.jsIncludeThirdParty = includeThirdPartyModules
-		o.vuexStoreRootPath = storeRootPath
+		o.vuexOut = out
+		o.vuexRootPath = vuexRootPath
 	}
 }
 
-func WithDartGeneration(includeThirdPartyModules bool, out func(module.Module) (path string), rootPath string) Option {
+func WithComposablesGeneration(out ModulePathFunc, composablesRootPath string) Option {
 	return func(o *generateOptions) {
-		o.dartOut = out
-		o.dartIncludeThirdParty = includeThirdPartyModules
-		o.dartRootPath = rootPath
+		o.composablesOut = out
+		o.composablesRootPath = composablesRootPath
+	}
+}
+
+func WithHooksGeneration(out ModulePathFunc, hooksRootPath string) Option {
+	return func(o *generateOptions) {
+		o.hooksOut = out
+		o.hooksRootPath = hooksRootPath
 	}
 }
 
@@ -84,24 +97,26 @@ func IncludeDirs(dirs []string) Option {
 // generator generates code for sdk and sdk apps.
 type generator struct {
 	ctx          context.Context
+	cacheStorage cache.Storage
 	appPath      string
 	protoDir     string
 	o            *generateOptions
 	sdkImport    string
-	deps         []gomodmodule.Version
+	deps         []gomodule.Version
 	appModules   []module.Module
 	thirdModules map[string][]module.Module // app dependency-modules pair.
 }
 
 // Generate generates code from protoDir of an SDK app residing at appPath with given options.
 // protoDir must be relative to the projectPath.
-func Generate(ctx context.Context, appPath, protoDir string, options ...Option) error {
+func Generate(ctx context.Context, cacheStorage cache.Storage, appPath, protoDir string, options ...Option) error {
 	g := &generator{
 		ctx:          ctx,
 		appPath:      appPath,
 		protoDir:     protoDir,
 		o:            &generateOptions{},
 		thirdModules: make(map[string][]module.Module),
+		cacheStorage: cacheStorage,
 	}
 
 	for _, apply := range options {
@@ -112,23 +127,62 @@ func Generate(ctx context.Context, appPath, protoDir string, options ...Option) 
 		return err
 	}
 
+	// Go generation must run first so the types are created before other
+	// generated code that requires sdk.Msg implementations to be defined
 	if g.o.gomodPath != "" {
 		if err := g.generateGo(); err != nil {
 			return err
 		}
 	}
 
-	// js generation requires Go types to be existent in the source code. because
-	// sdk.Msg implementations defined on the generated Go types.
-	// so it needs to run after Go code gen.
 	if g.o.jsOut != nil {
-		if err := g.generateJS(); err != nil {
+		if err := g.generateTS(); err != nil {
 			return err
 		}
 	}
 
-	if g.o.dartOut != nil {
-		if err := g.generateDart(); err != nil {
+	if g.o.vuexOut != nil {
+		if err := g.generateVuex(); err != nil {
+			return err
+		}
+
+		// Update Vuex store dependencies when Vuex stores are generated.
+		// This update is required to link the "ts-client" folder so the
+		// package is available during development before publishing it.
+		if err := g.updateVuexDependencies(); err != nil {
+			return err
+		}
+
+		// Update Vue app dependencies when Vuex stores are generated.
+		// This update is required to link the "ts-client" folder so the
+		// package is available during development before publishing it.
+		if err := g.updateVueDependencies(); err != nil {
+			return err
+		}
+
+	}
+
+	if g.o.composablesRootPath != "" {
+		if err := g.generateComposables("vue"); err != nil {
+			return err
+		}
+
+		// Update Vue app dependencies when Vue composables are generated.
+		// This update is required to link the "ts-client" folder so the
+		// package is available during development before publishing it.
+		if err := g.updateComposableDependencies("vue"); err != nil {
+			return err
+		}
+	}
+	if g.o.hooksRootPath != "" {
+		if err := g.generateComposables("react"); err != nil {
+			return err
+		}
+
+		// Update React app dependencies when React hooks are generated.
+		// This update is required to link the "ts-client" folder so the
+		// package is available during development before publishing it.
+		if err := g.updateComposableDependencies("react"); err != nil {
 			return err
 		}
 	}
@@ -140,5 +194,22 @@ func Generate(ctx context.Context, appPath, protoDir string, options ...Option) 
 	}
 
 	return nil
+}
 
+// TypescriptModulePath generates TS module paths for Cosmos SDK modules.
+// The root path is used as prefix for the generated paths.
+func TypescriptModulePath(rootPath string) ModulePathFunc {
+	return func(m module.Module) string {
+		return filepath.Join(rootPath, m.Pkg.Name)
+	}
+}
+
+// ComposableModulePath generates useQuery hook/composable module paths for Cosmos SDK modules.
+// The root path is used as prefix for the generated paths.
+func ComposableModulePath(rootPath string) ModulePathFunc {
+	return func(m module.Module) string {
+		replacer := strings.NewReplacer("-", "_", ".", "_")
+		modPath := strcase.ToCamel(replacer.Replace(m.Pkg.Name))
+		return filepath.Join(rootPath, "use"+modPath)
+	}
 }

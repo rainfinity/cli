@@ -3,17 +3,17 @@ package modulecreate
 import (
 	"fmt"
 
-	"github.com/ignite-hq/cli/ignite/pkg/xstrings"
-	"github.com/ignite-hq/cli/ignite/templates/field"
+	"github.com/iancoleman/strcase"
+
+	"github.com/ignite/cli/ignite/templates/field"
 )
 
-// CreateOptions represents the options to scaffold a Cosmos SDK module
+// CreateOptions represents the options to scaffold a Cosmos SDK module.
 type CreateOptions struct {
 	ModuleName string
 	ModulePath string
 	AppName    string
 	AppPath    string
-	OwnerName  string
 	Params     field.Fields
 
 	// True if the module should implement the IBC module interface
@@ -26,34 +26,30 @@ type CreateOptions struct {
 	Dependencies []Dependency
 }
 
-// MsgServerOptions defines options to add MsgServer
+// MsgServerOptions defines options to add MsgServer.
 type MsgServerOptions struct {
 	ModuleName string
 	ModulePath string
 	AppName    string
 	AppPath    string
-	OwnerName  string
 }
 
-// Validate that options are usable
+// Validate that options are usable.
 func (opts *CreateOptions) Validate() error {
 	return nil
 }
 
-// Dependency represents a module dependency of a module
-type Dependency struct {
-	Name       string
-	KeeperName string // KeeperName represents the name of the keeper for the module in app.go
+// NewDependency returns a new dependency.
+func NewDependency(name string) Dependency {
+	return Dependency{Name: strcase.ToCamel(name)}
 }
 
-// NewDependency returns a new dependency object
-func NewDependency(name, keeperName string) Dependency {
-	// Default keeper name
-	if keeperName == "" {
-		keeperName = fmt.Sprintf("%sKeeper", xstrings.Title(name))
-	}
-	return Dependency{
-		name,
-		keeperName,
-	}
+// Dependency represents a module dependency of a module.
+type Dependency struct {
+	Name string
+}
+
+// KeeperName returns the keeper's name for the dependency module.
+func (d Dependency) KeeperName() string {
+	return fmt.Sprint(d.Name, "Keeper")
 }

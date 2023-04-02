@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -13,9 +14,9 @@ import (
 	"github.com/cenkalti/backoff"
 	"github.com/pkg/errors"
 
-	"github.com/ignite-hq/cli/ignite/pkg/chaincmd"
-	"github.com/ignite-hq/cli/ignite/pkg/cmdrunner/step"
-	"github.com/ignite-hq/cli/ignite/pkg/cosmosver"
+	"github.com/ignite/cli/ignite/pkg/chaincmd"
+	"github.com/ignite/cli/ignite/pkg/cmdrunner/step"
+	"github.com/ignite/cli/ignite/pkg/cosmosver"
 )
 
 // Start starts the blockchain.
@@ -24,15 +25,6 @@ func (r Runner) Start(ctx context.Context, args ...string) error {
 		ctx,
 		runOptions{wrappedStdErrMaxLen: 50000},
 		r.chainCmd.StartCommand(args...),
-	)
-}
-
-// LaunchpadStartRestServer start launchpad rest server.
-func (r Runner) LaunchpadStartRestServer(ctx context.Context, apiAddress, rpcAddress string) error {
-	return r.run(
-		ctx,
-		runOptions{wrappedStdErrMaxLen: 50000},
-		r.chainCmd.LaunchpadRestServerCommand(apiAddress, rpcAddress),
 	)
 }
 
@@ -50,20 +42,6 @@ type KV struct {
 // NewKV returns a new key, value pair.
 func NewKV(key, value string) KV {
 	return KV{key, value}
-}
-
-// LaunchpadSetConfigs updates configurations for a launchpad app.
-func (r Runner) LaunchpadSetConfigs(ctx context.Context, kvs ...KV) error {
-	for _, kv := range kvs {
-		if err := r.run(
-			ctx,
-			runOptions{},
-			r.chainCmd.LaunchpadSetConfigCommand(kv.key, kv.value),
-		); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 var gentxRe = regexp.MustCompile(`(?m)"(.+?)"`)
@@ -173,16 +151,23 @@ func (r Runner) BankSend(ctx context.Context, fromAccount, toAccount, amount str
 
 	if r.chainCmd.KeyringPassword() != "" {
 		input := &bytes.Buffer{}
-		fmt.Fprintln(input, r.chainCmd.KeyringPassword())
-		fmt.Fprintln(input, r.chainCmd.KeyringPassword())
-		fmt.Fprintln(input, r.chainCmd.KeyringPassword())
+		_, err := fmt.Fprintln(input, r.chainCmd.KeyringPassword())
+		if err != nil {
+			return "", err
+		}
+		_, err = fmt.Fprintln(input, r.chainCmd.KeyringPassword())
+		if err != nil {
+			return "", err
+		}
+		_, err = fmt.Fprintln(input, r.chainCmd.KeyringPassword())
+		if err != nil {
+			return "", err
+		}
 		opt = append(opt, step.Write(input.Bytes()))
 	}
 
 	if err := r.run(ctx, runOptions{stdout: b}, opt...); err != nil {
-		if strings.Contains(err.Error(), "key not found") || // stargate
-			strings.Contains(err.Error(), "unknown address") || // launchpad
-			strings.Contains(b.String(), "item could not be found") { // launchpad
+		if strings.Contains(err.Error(), "key not found") {
 			return "", errors.New("account doesn't have any balances")
 		}
 
@@ -201,7 +186,7 @@ func (r Runner) BankSend(ctx context.Context, fromAccount, toAccount, amount str
 	return txResult.TxHash, nil
 }
 
-// WaitTx waits until a tx is successfully added to a block and can be queried
+// WaitTx waits until a tx is successfully added to a block and can be queried.
 func (r Runner) WaitTx(ctx context.Context, txHash string, retryDelay time.Duration, maxRetry int) error {
 	retry := 0
 
@@ -234,8 +219,14 @@ func (r Runner) WaitTx(ctx context.Context, txHash string, retryDelay time.Durat
 	return backoff.Retry(checkTx, backoff.WithContext(backoff.NewConstantBackOff(retryDelay), ctx))
 }
 
-// Export exports the state of the chain into the specified file
+// Export exports the state of the chain into the specified file.
 func (r Runner) Export(ctx context.Context, exportedFile string) error {
+	// Make sure the path exists
+	dir := filepath.Dir(exportedFile)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+
 	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
 	if err := r.run(ctx, runOptions{stdout: stdout, stderr: stderr}, r.chainCmd.ExportCommand()); err != nil {
 		return err
@@ -250,7 +241,7 @@ func (r Runner) Export(ctx context.Context, exportedFile string) error {
 	}
 
 	// Save the new state
-	return os.WriteFile(exportedFile, exportedState, 0644)
+	return os.WriteFile(exportedFile, exportedState, 0o644)
 }
 
 // EventSelector is used to query events.
@@ -284,7 +275,7 @@ func (r Runner) QueryTxEvents(
 	selector EventSelector,
 	moreSelectors ...EventSelector,
 ) ([]Event, error) {
-	// prepare the slector.
+	// prepare the selector.
 	var list []string
 
 	eventsSelectors := append([]EventSelector{selector}, moreSelectors...)
@@ -295,7 +286,7 @@ func (r Runner) QueryTxEvents(
 
 	query := strings.Join(list, "&")
 
-	// execute the commnd and parse the output.
+	// execute the command and parse the output.
 	b := newBuffer()
 
 	if err := r.run(ctx, runOptions{stdout: b}, r.chainCmd.QueryTxEventsCommand(query)); err != nil {

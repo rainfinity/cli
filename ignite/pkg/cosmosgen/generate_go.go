@@ -7,16 +7,14 @@ import (
 	"github.com/otiai10/copy"
 	"github.com/pkg/errors"
 
-	"github.com/ignite-hq/cli/ignite/pkg/protoanalysis"
-	"github.com/ignite-hq/cli/ignite/pkg/protoc"
+	"github.com/ignite/cli/ignite/pkg/protoanalysis"
+	"github.com/ignite/cli/ignite/pkg/protoc"
 )
 
-var (
-	goOuts = []string{
-		"--gocosmos_out=plugins=interfacetype+grpc,Mgoogle/protobuf/any.proto=github.com/cosmos/cosmos-sdk/codec/types:.",
-		"--grpc-gateway_out=logtostderr=true:.",
-	}
-)
+var goOuts = []string{
+	"--gocosmos_out=plugins=interfacetype+grpc,Mgoogle/protobuf/any.proto=github.com/cosmos/cosmos-sdk/codec/types:.",
+	"--grpc-gateway_out=logtostderr=true:.",
+}
 
 func (g *generator) generateGo() error {
 	includePaths, err := g.resolveInclude(g.appPath)
@@ -24,9 +22,9 @@ func (g *generator) generateGo() error {
 		return err
 	}
 
-	// created a temporary dir to locate generated code under which later only some of them will be moved to the
-	// app's source code. this also prevents having leftover files in the app's source code or its parent dir -when
-	// command executed directly there- in case of an interrupt.
+	// create a temporary dir to locate generated code under which later only some of them will be moved to the
+	// app's source code. this also prevents having leftover files in the app's source code or its parent dir - when
+	// command executed directly there - in case of an interrupt.
 	tmp, err := os.MkdirTemp("", "")
 	if err != nil {
 		return err

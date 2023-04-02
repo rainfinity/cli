@@ -1,36 +1,37 @@
 package cosmosutil
 
 import (
-	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 
+	sdkmath "cosmossdk.io/math"
 	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/tendermint/tendermint/crypto/ed25519"
 )
 
-var GentxFilename = "gentx.json"
+const GentxFilename = "gentx.json"
 
 type (
-	// PubKey represents the public key in bytes array
-	PubKey []byte
-
-	// GentxInfo represents the basic info about gentx file
+	// GentxInfo represents the basic info about gentx file.
 	GentxInfo struct {
 		DelegatorAddress string
-		PubKey           PubKey
+		PubKey           ed25519.PubKey
 		SelfDelegation   sdk.Coin
 		Memo             string
 	}
 
-	// StargateGentx represents the stargate gentx file
-	StargateGentx struct {
+	// Gentx represents the gentx file.
+	Gentx struct {
 		Body struct {
 			Messages []struct {
 				DelegatorAddress string `json:"delegator_address"`
 				ValidatorAddress string `json:"validator_address"`
 				PubKey           struct {
-					Key string `json:"key"`
+					Type string `json:"@type"`
+					Key  string `json:"key"`
 				} `json:"pubkey"`
 				Value struct {
 					Denom  string `json:"denom"`
@@ -42,13 +43,7 @@ type (
 	}
 )
 
-// Equal returns true if the public keys are equal
-func (pb PubKey) Equal(key []byte) bool {
-	res := bytes.Compare(pb, key)
-	return res == 0
-}
-
-// GentxFromPath returns GentxInfo from the json file
+// GentxFromPath returns GentxInfo from the json file.
 func GentxFromPath(path string) (info GentxInfo, gentx []byte, err error) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return info, gentx, errors.New("chain home folder is not initialized yet: " + path)
@@ -58,39 +53,44 @@ func GentxFromPath(path string) (info GentxInfo, gentx []byte, err error) {
 	if err != nil {
 		return info, gentx, err
 	}
-	return ParseGentx(gentx)
+
+	info, err = ParseGentx(gentx)
+	return info, gentx, err
 }
 
-// ParseGentx returns GentxInfo and the gentx file in bytes
-// TODO refector. no need to return file, it's already given as gentx in the argument.
-func ParseGentx(gentx []byte) (info GentxInfo, file []byte, err error) {
-	// Try parsing Stargate gentx
-	var stargateGentx StargateGentx
-	if err := json.Unmarshal(gentx, &stargateGentx); err != nil {
-		return info, gentx, err
+// ParseGentx returns GentxInfo and the gentx file in bytes.
+func ParseGentx(gentxBz []byte) (info GentxInfo, err error) {
+	// Try parsing gentx
+	var gentx Gentx
+	if err := json.Unmarshal(gentxBz, &gentx); err != nil {
+		return info, fmt.Errorf("unmarshal gentx: %w", err)
 	}
-	if stargateGentx.Body.Messages == nil {
-		return info, gentx, errors.New("the gentx cannot be parsed")
-	}
-
-	// This is a stargate gentx
-	if len(stargateGentx.Body.Messages) != 1 {
-		return info, gentx, errors.New("add validator gentx must contain 1 message")
+	if gentx.Body.Messages == nil {
+		return info, errors.New("the gentx cannot be parsed")
 	}
 
-	info.Memo = stargateGentx.Body.Memo
-	info.DelegatorAddress = stargateGentx.Body.Messages[0].DelegatorAddress
-	info.PubKey = []byte(stargateGentx.Body.Messages[0].PubKey.Key)
+	if len(gentx.Body.Messages) != 1 {
+		return info, errors.New("add validator gentx must contain 1 message")
+	}
 
-	amount, ok := sdk.NewIntFromString(stargateGentx.Body.Messages[0].Value.Amount)
+	info.Memo = gentx.Body.Memo
+	info.DelegatorAddress = gentx.Body.Messages[0].DelegatorAddress
+
+	pb := gentx.Body.Messages[0].PubKey.Key
+	info.PubKey, err = base64.StdEncoding.DecodeString(pb)
+	if err != nil {
+		return info, fmt.Errorf("invalid validator public key %w", err)
+	}
+
+	amount, ok := sdkmath.NewIntFromString(gentx.Body.Messages[0].Value.Amount)
 	if !ok {
-		return info, gentx, errors.New("the self-delegation inside the gentx is invalid")
+		return info, errors.New("the self-delegation inside the gentx is invalid")
 	}
 
 	info.SelfDelegation = sdk.NewCoin(
-		stargateGentx.Body.Messages[0].Value.Denom,
+		gentx.Body.Messages[0].Value.Denom,
 		amount,
 	)
 
-	return info, gentx, nil
+	return info, nil
 }

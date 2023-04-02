@@ -11,9 +11,9 @@ import (
 
 func TestAll(t *testing.T) {
 	cases := []struct {
-		name         string
-		ec           EncodingCreator
-		hellocontent string
+		name    string
+		ec      EncodingCreator
+		content string
 	}{
 		{"json", DefaultJSONEncodingCreator, `{"hello":"world"}`},
 		{"yaml", DefaultYAMLEncodingCreator, `hello: world`},
@@ -26,7 +26,6 @@ func TestAll(t *testing.T) {
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-
 			file, err := os.CreateTemp("", "")
 			require.NoError(t, err)
 			defer func() {
@@ -34,7 +33,7 @@ func TestAll(t *testing.T) {
 				os.Remove(file.Name())
 			}()
 
-			_, err = io.Copy(file, strings.NewReader(tt.hellocontent))
+			_, err = io.Copy(file, strings.NewReader(tt.content))
 			require.NoError(t, err)
 
 			cf := New(tt.ec, file.Name())
@@ -51,5 +50,4 @@ func TestAll(t *testing.T) {
 			require.Equal(t, "cosmos", d2.Hello)
 		})
 	}
-
 }

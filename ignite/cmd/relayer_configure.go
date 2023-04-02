@@ -3,16 +3,16 @@ package ignitecmd
 import (
 	"fmt"
 
-	"github.com/briandowns/spinner"
 	"github.com/gookit/color"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 
-	"github.com/ignite-hq/cli/ignite/pkg/cliquiz"
-	"github.com/ignite-hq/cli/ignite/pkg/clispinner"
-	"github.com/ignite-hq/cli/ignite/pkg/cosmosaccount"
-	"github.com/ignite-hq/cli/ignite/pkg/entrywriter"
-	"github.com/ignite-hq/cli/ignite/pkg/relayer"
+	"github.com/ignite/cli/ignite/pkg/cliui"
+	"github.com/ignite/cli/ignite/pkg/cliui/cliquiz"
+	"github.com/ignite/cli/ignite/pkg/cliui/entrywriter"
+	"github.com/ignite/cli/ignite/pkg/cosmosaccount"
+	"github.com/ignite/cli/ignite/pkg/relayer"
+	relayerconfig "github.com/ignite/cli/ignite/pkg/relayer/config"
 )
 
 const (
@@ -34,9 +34,12 @@ const (
 	flagSourceAddressPrefix = "source-prefix"
 	flagTargetAddressPrefix = "target-prefix"
 	flagOrdered             = "ordered"
+	flagReset               = "reset"
+	flagSourceClientID      = "source-client-id"
+	flagTargetClientID      = "target-client-id"
 
-	relayerSource = "source"
-	relayerTarget = "target"
+	RelayerSource = "source"
+	RelayerTarget = "target"
 
 	defaultSourceRPCAddress = "http://localhost:26657"
 	defaultTargetRPCAddress = "https://rpc.cosmos.network:443"
@@ -59,36 +62,45 @@ func NewRelayerConfigure() *cobra.Command {
 		Aliases: []string{"conf"},
 		RunE:    relayerConfigureHandler,
 	}
-	c.Flags().BoolP(flagAdvanced, "a", false, "Advanced configuration options for custom IBC modules")
+
+	c.Flags().BoolP(flagAdvanced, "a", false, "advanced configuration options for custom IBC modules")
 	c.Flags().String(flagSourceRPC, "", "RPC address of the source chain")
 	c.Flags().String(flagTargetRPC, "", "RPC address of the target chain")
-	c.Flags().String(flagSourceFaucet, "", "Faucet address of the source chain")
-	c.Flags().String(flagTargetFaucet, "", "Faucet address of the target chain")
+	c.Flags().String(flagSourceFaucet, "", "faucet address of the source chain")
+	c.Flags().String(flagTargetFaucet, "", "faucet address of the target chain")
 	c.Flags().String(flagSourcePort, "", "IBC port ID on the source chain")
-	c.Flags().String(flagSourceVersion, "", "Module version on the source chain")
+	c.Flags().String(flagSourceVersion, "", "module version on the source chain")
 	c.Flags().String(flagTargetPort, "", "IBC port ID on the target chain")
-	c.Flags().String(flagTargetVersion, "", "Module version on the target chain")
-	c.Flags().String(flagSourceGasPrice, "", "Gas price used for transactions on source chain")
-	c.Flags().String(flagTargetGasPrice, "", "Gas price used for transactions on target chain")
-	c.Flags().Int64(flagSourceGasLimit, 0, "Gas limit used for transactions on source chain")
-	c.Flags().Int64(flagTargetGasLimit, 0, "Gas limit used for transactions on target chain")
-	c.Flags().String(flagSourceAddressPrefix, "", "Address prefix of the source chain")
-	c.Flags().String(flagTargetAddressPrefix, "", "Address prefix of the target chain")
-	c.Flags().String(flagSourceAccount, "", "Source Account")
-	c.Flags().String(flagTargetAccount, "", "Target Account")
-	c.Flags().Bool(flagOrdered, false, "Set the channel as ordered")
+	c.Flags().String(flagTargetVersion, "", "module version on the target chain")
+	c.Flags().String(flagSourceGasPrice, "", "gas price used for transactions on source chain")
+	c.Flags().String(flagTargetGasPrice, "", "gas price used for transactions on target chain")
+	c.Flags().Int64(flagSourceGasLimit, 0, "gas limit used for transactions on source chain")
+	c.Flags().Int64(flagTargetGasLimit, 0, "gas limit used for transactions on target chain")
+	c.Flags().String(flagSourceAddressPrefix, "", "address prefix of the source chain")
+	c.Flags().String(flagTargetAddressPrefix, "", "address prefix of the target chain")
+	c.Flags().String(flagSourceAccount, "", "source Account")
+	c.Flags().String(flagTargetAccount, "", "target Account")
+	c.Flags().Bool(flagOrdered, false, "set the channel as ordered")
+	c.Flags().BoolP(flagReset, "r", false, "reset the relayer config")
+	c.Flags().String(flagSourceClientID, "", "use a custom client id for source")
+	c.Flags().String(flagTargetClientID, "", "use a custom client id for target")
 	c.Flags().AddFlagSet(flagSetKeyringBackend())
+	c.Flags().AddFlagSet(flagSetKeyringDir())
 
 	return c
 }
 
-func relayerConfigureHandler(cmd *cobra.Command, args []string) (err error) {
+func relayerConfigureHandler(cmd *cobra.Command, _ []string) (err error) {
 	defer func() {
 		err = handleRelayerAccountErr(err)
 	}()
 
+	session := cliui.New()
+	defer session.End()
+
 	ca, err := cosmosaccount.New(
 		cosmosaccount.WithKeyringBackend(getKeyringBackend(cmd)),
+		cosmosaccount.WithHome(getKeyringDir(cmd)),
 	)
 	if err != nil {
 		return err
@@ -98,10 +110,9 @@ func relayerConfigureHandler(cmd *cobra.Command, args []string) (err error) {
 		return err
 	}
 
-	s := clispinner.New().Stop()
-	defer s.Stop()
-
-	printSection("Setting up chains")
+	if err := printSection(session, "Setting up chains"); err != nil {
+		return err
+	}
 
 	// basic configuration
 	var (
@@ -296,8 +307,13 @@ func relayerConfigureHandler(cmd *cobra.Command, args []string) (err error) {
 	if err != nil {
 		return err
 	}
+	var (
+		sourceClientID, _ = cmd.Flags().GetString(flagSourceClientID)
+		targetClientID, _ = cmd.Flags().GetString(flagTargetClientID)
+		reset, _          = cmd.Flags().GetBool(flagReset)
 
-	var questions []cliquiz.Question
+		questions []cliquiz.Question
+	)
 
 	// get information from prompt if flag not provided
 	if sourceAccount == "" {
@@ -352,51 +368,68 @@ func relayerConfigureHandler(cmd *cobra.Command, args []string) (err error) {
 		}
 	}
 
+	session.PauseSpinner()
 	if len(questions) > 0 {
-		if err := cliquiz.Ask(questions...); err != nil {
+		if err := session.Ask(questions...); err != nil {
 			return err
 		}
 	}
 
+	if reset {
+		if err := relayerconfig.Delete(); err != nil {
+			return err
+		}
+	}
+
+	session.StartSpinner("Fetching chain info...")
+
+	session.Println()
 	r := relayer.New(ca)
 
-	fmt.Println()
-	s.SetText("Fetching chain info...")
-
 	// initialize the chains
-	sourceChain, err := initChain(
+	sourceChain, err := InitChain(
 		cmd,
 		r,
-		s,
-		relayerSource,
+		session,
+		RelayerSource,
 		sourceAccount,
 		sourceRPCAddress,
 		sourceFaucetAddress,
 		sourceGasPrice,
 		sourceGasLimit,
 		sourceAddressPrefix,
+		sourceClientID,
 	)
 	if err != nil {
 		return err
 	}
 
-	targetChain, err := initChain(
+	if err := sourceChain.EnsureChainSetup(cmd.Context()); err != nil {
+		return err
+	}
+
+	targetChain, err := InitChain(
 		cmd,
 		r,
-		s,
-		relayerTarget,
+		session,
+		RelayerTarget,
 		targetAccount,
 		targetRPCAddress,
 		targetFaucetAddress,
 		targetGasPrice,
 		targetGasLimit,
 		targetAddressPrefix,
+		targetClientID,
 	)
 	if err != nil {
 		return err
 	}
 
-	s.SetText("Configuring...").Start()
+	if err := targetChain.EnsureChainSetup(cmd.Context()); err != nil {
+		return err
+	}
+
+	session.StartSpinner("Configuring...")
 
 	// sets advanced channel options
 	var channelOptions []relayer.ChannelOption
@@ -414,74 +447,68 @@ func relayerConfigureHandler(cmd *cobra.Command, args []string) (err error) {
 	}
 
 	// create the connection configuration
-	id, err := sourceChain.Connect(cmd.Context(), targetChain, channelOptions...)
+	id, err := sourceChain.Connect(targetChain, channelOptions...)
 	if err != nil {
 		return err
 	}
 
-	s.Stop()
-
-	fmt.Printf("⛓  Configured chains: %s\n\n", color.Green.Sprint(id))
-
-	return nil
+	return session.Printf("⛓  Configured chains: %s\n\n", color.Green.Sprint(id))
 }
 
-// initChain initializes chain information for the relayer connection
-func initChain(
+// InitChain initializes chain information for the relayer connection.
+func InitChain(
 	cmd *cobra.Command,
 	r relayer.Relayer,
-	s *clispinner.Spinner,
+	session *cliui.Session,
 	name,
 	accountName,
 	rpcAddr,
 	faucetAddr,
 	gasPrice string,
 	gasLimit int64,
-	addressPrefix string,
+	addressPrefix,
+	clientID string,
 ) (*relayer.Chain, error) {
-	defer s.Stop()
-	s.SetText("Initializing chain...").Start()
+	defer session.StopSpinner()
+	session.StartSpinner(fmt.Sprintf("Initializing chain %s...", name))
 
 	c, account, err := r.NewChain(
-		cmd.Context(),
 		accountName,
 		rpcAddr,
 		relayer.WithFaucet(faucetAddr),
 		relayer.WithGasPrice(gasPrice),
 		relayer.WithGasLimit(gasLimit),
 		relayer.WithAddressPrefix(addressPrefix),
+		relayer.WithClientID(clientID),
 	)
 	if err != nil {
 		return nil, errors.Wrapf(err, "cannot resolve %s", name)
 	}
 
-	s.Stop()
+	accountAddr, err := account.Address(addressPrefix)
+	if err != nil {
+		return nil, err
+	}
 
-	accountAddr := account.Address(addressPrefix)
-
-	fmt.Printf("🔐  Account on %q is %s(%s)\n \n", name, accountName, accountAddr)
-	s.
-		SetCharset(spinner.CharSets[9]).
-		SetColor("white").
-		SetPrefix(" |·").
-		SetText(color.Yellow.Sprintf("trying to receive tokens from a faucet...")).
-		Start()
+	session.StopSpinner()
+	session.Printf("🔐  Account on %q is %s(%s)\n \n", name, accountName, accountAddr)
+	session.StartSpinner(color.Yellow.Sprintf("trying to receive tokens from a faucet..."))
 
 	coins, err := c.TryRetrieve(cmd.Context())
-	s.Stop()
 
-	fmt.Print(" |· ")
+	session.StopSpinner()
+	session.Print(" |· ")
 	if err != nil {
-		fmt.Println(color.Yellow.Sprintf(err.Error()))
+		session.Println(color.Yellow.Sprintf(err.Error()))
 	} else {
-		fmt.Println(color.Green.Sprintf("received coins from a faucet"))
+		session.Println(color.Green.Sprintf("received coins from a faucet"))
 	}
 
 	balance := coins.String()
 	if balance == "" {
 		balance = entrywriter.None
 	}
-	fmt.Printf(" |· (balance: %s)\n\n", balance)
+	session.Printf(" |· (balance: %s)\n\n", balance)
 
 	return c, nil
 }

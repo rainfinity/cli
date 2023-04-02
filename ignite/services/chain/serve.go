@@ -14,45 +14,62 @@ import (
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/ignite-hq/cli/ignite/chainconfig"
-	chaincmdrunner "github.com/ignite-hq/cli/ignite/pkg/chaincmd/runner"
-	"github.com/ignite-hq/cli/ignite/pkg/cosmosfaucet"
-	"github.com/ignite-hq/cli/ignite/pkg/dirchange"
-	"github.com/ignite-hq/cli/ignite/pkg/localfs"
-	"github.com/ignite-hq/cli/ignite/pkg/xexec"
-	"github.com/ignite-hq/cli/ignite/pkg/xfilepath"
-	"github.com/ignite-hq/cli/ignite/pkg/xhttp"
-	"github.com/ignite-hq/cli/ignite/pkg/xurl"
+	"github.com/ignite/cli/ignite/config"
+	chainconfig "github.com/ignite/cli/ignite/config/chain"
+	"github.com/ignite/cli/ignite/pkg/cache"
+	chaincmdrunner "github.com/ignite/cli/ignite/pkg/chaincmd/runner"
+	"github.com/ignite/cli/ignite/pkg/cliui/colors"
+	"github.com/ignite/cli/ignite/pkg/cliui/icons"
+	"github.com/ignite/cli/ignite/pkg/cliui/view/accountview"
+	"github.com/ignite/cli/ignite/pkg/cliui/view/errorview"
+	"github.com/ignite/cli/ignite/pkg/cosmosfaucet"
+	"github.com/ignite/cli/ignite/pkg/dirchange"
+	"github.com/ignite/cli/ignite/pkg/events"
+	"github.com/ignite/cli/ignite/pkg/localfs"
+	"github.com/ignite/cli/ignite/pkg/xexec"
+	"github.com/ignite/cli/ignite/pkg/xfilepath"
+	"github.com/ignite/cli/ignite/pkg/xhttp"
+	"github.com/ignite/cli/ignite/pkg/xurl"
 )
 
 const (
-	// exportedGenesis is the name of the exported genesis file for a chain
+	// EvtGroupPath is the group to use for path related events.
+	EvtGroupPath = "path"
+
+	// exportedGenesis is the name of the exported genesis file for a chain.
 	exportedGenesis = "exported_genesis.json"
 
-	// sourceChecksum is the file containing the checksum to detect source modification
-	sourceChecksum = "source_checksum.txt"
+	// sourceChecksumKey is the cache key for the checksum to detect source modification.
+	sourceChecksumKey = "source_checksum"
 
-	// binaryChecksum is the file containing the checksum to detect binary modification
-	binaryChecksum = "binary_checksum.txt"
+	// binaryChecksumKey is the cache key for the checksum to detect binary modification.
+	binaryChecksumKey = "binary_checksum"
 
-	// configChecksum is the file containing the checksum to detect config modification
-	configChecksum = "config_checksum.txt"
+	// configChecksumKey is the cache key for containing the checksum to detect config modification.
+	configChecksumKey = "config_checksum"
+
+	// serveDirchangeCacheNamespace is the name of the cache namespace for detecting changes in directories.
+	serveDirchangeCacheNamespace = "serve.dirchange"
 )
 
 var (
 	// ignoredExts holds a list of ignored files from watching.
 	ignoredExts = []string{"pb.go", "pb.gw.go"}
 
-	// starportSavePath is the place where chain exported genesis are saved
+	// starportSavePath is the place where chain exported genesis are saved.
 	starportSavePath = xfilepath.Join(
-		chainconfig.ConfigDirPath,
+		config.DirPath,
 		xfilepath.Path("local-chains"),
 	)
 )
 
 type serveOptions struct {
-	forceReset bool
-	resetOnce  bool
+	forceReset      bool
+	resetOnce       bool
+	skipProto       bool
+	quitOnFail      bool
+	generateClients bool
+	buildTags       []string
 }
 
 func newServeOption() serveOptions {
@@ -62,25 +79,53 @@ func newServeOption() serveOptions {
 	}
 }
 
-// ServeOption provides options for the serve command
+// ServeOption provides options for the serve command.
 type ServeOption func(*serveOptions)
 
-// ServeForceReset allows to force reset of the state when the chain is served and on every source change
+// ServeForceReset allows to force reset of the state when the chain is served and on every source change.
 func ServeForceReset() ServeOption {
 	return func(c *serveOptions) {
 		c.forceReset = true
 	}
 }
 
-// ServeResetOnce allows to reset of the state when the chain is served once
+// ServeResetOnce allows to reset of the state when the chain is served once.
 func ServeResetOnce() ServeOption {
 	return func(c *serveOptions) {
 		c.resetOnce = true
 	}
 }
 
+// QuitOnFail exits the serve immediately if an error occurs.
+func QuitOnFail() ServeOption {
+	return func(c *serveOptions) {
+		c.quitOnFail = true
+	}
+}
+
+// GenerateClients enables client code generation.
+func GenerateClients() ServeOption {
+	return func(c *serveOptions) {
+		c.generateClients = true
+	}
+}
+
+// ServeSkipProto allows to serve the app without generate Go from proto.
+func ServeSkipProto() ServeOption {
+	return func(c *serveOptions) {
+		c.skipProto = true
+	}
+}
+
+// BuildTags set the build tags for the go build.
+func BuildTags(buildTags ...string) ServeOption {
+	return func(c *serveOptions) {
+		c.buildTags = buildTags
+	}
+}
+
 // Serve serves an app.
-func (c *Chain) Serve(ctx context.Context, options ...ServeOption) error {
+func (c *Chain) Serve(ctx context.Context, cacheStorage cache.Storage, options ...ServeOption) error {
 	serveOptions := newServeOption()
 
 	// apply the options
@@ -113,6 +158,7 @@ func (c *Chain) Serve(ctx context.Context, options ...ServeOption) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -124,17 +170,26 @@ func (c *Chain) Serve(ctx context.Context, options ...ServeOption) error {
 				}
 
 				var (
-					serveCtx context.Context
-					buildErr *CannotBuildAppError
-					startErr *CannotStartAppError
+					serveCtx      context.Context
+					buildErr      *CannotBuildAppError
+					startErr      *CannotStartAppError
+					validationErr *chainconfig.ValidationError
 				)
+
 				serveCtx, c.serveCancel = context.WithCancel(ctx)
 
 				// determine if the chain should reset the state
 				shouldReset := serveOptions.forceReset || serveOptions.resetOnce
 
 				// serve the app.
-				err = c.serve(serveCtx, shouldReset)
+				err = c.serve(
+					serveCtx,
+					cacheStorage,
+					serveOptions.buildTags,
+					shouldReset,
+					serveOptions.skipProto,
+					serveOptions.generateClients,
+				)
 				serveOptions.resetOnce = false
 
 				switch {
@@ -144,31 +199,41 @@ func (c *Chain) Serve(ctx context.Context, options ...ServeOption) error {
 					if c.served {
 						c.served = false
 
-						fmt.Fprintln(c.stdLog().out, "💿 Saving genesis state...")
+						c.ev.Send("Saving genesis state...", events.ProgressStart())
 
 						// If serve has been stopped, save the genesis state
 						if err := c.saveChainState(context.TODO(), commands); err != nil {
-							fmt.Fprint(c.stdLog().err, err.Error())
+							c.ev.SendError(err, events.ProgressFinish())
 							return err
 						}
 
 						genesisPath, err := c.exportedGenesisPath()
 						if err != nil {
-							fmt.Fprintln(c.stdLog().err, err.Error())
 							return err
 						}
-						fmt.Fprintf(c.stdLog().out, "💿 Genesis state saved in %s\n", genesisPath)
+
+						// Inform where the genesis file is saved without using
+						// progress update to keep the event text in the terminal.
+						c.ev.Send(
+							fmt.Sprintf("Genesis state saved in %s", genesisPath),
+							events.Icon(icons.CD),
+						)
 					}
+				case errors.As(err, &validationErr):
+					if serveOptions.quitOnFail {
+						return err
+					}
+
+					// Change error message to add a link to the configuration docs
+					err = fmt.Errorf("%w\nsee: https://github.com/ignite/cli#configure", err)
+
+					c.ev.SendView(errorview.NewError(err), events.ProgressFinish(), events.Group(events.GroupError))
 				case errors.As(err, &buildErr):
-					fmt.Fprintf(c.stdLog().err, "%s\n", errorColor(err.Error()))
-
-					var validationErr *chainconfig.ValidationError
-					if errors.As(err, &validationErr) {
-						fmt.Fprintln(c.stdLog().out, "see: https://github.com/ignite-hq/cli#configure")
+					if serveOptions.quitOnFail {
+						return err
 					}
 
-					fmt.Fprintf(c.stdLog().out, "%s\n", infoColor("Waiting for a fix before retrying..."))
-
+					c.ev.SendView(errorview.NewError(err), events.ProgressFinish(), events.Group(events.GroupError))
 				case errors.As(err, &startErr):
 					// Parse returned error logs
 					parsedErr := startErr.ParseStartError()
@@ -177,10 +242,14 @@ func (c *Chain) Serve(ctx context.Context, options ...ServeOption) error {
 					// Therefore, the error may be caused by a new logic that is not compatible with the old app state
 					// We suggest the user to eventually reset the app state
 					if parsedErr == "" {
-						fmt.Fprintf(c.stdLog().out, "%s %s\n", infoColor(`Blockchain failed to start.
-If the new code is no longer compatible with the saved state, you can reset the database by launching:`), "starport chain serve --reset-once")
+						info := colors.Info(
+							"Blockchain failed to start.\n",
+							"If the new code is no longer compatible with the saved\n",
+							"state, you can reset the database by launching:",
+						)
+						command := colors.SprintFunc(colors.White)("ignite chain serve --reset-once")
 
-						return fmt.Errorf("cannot run %s", startErr.AppName)
+						return fmt.Errorf("cannot run %s\n\n%s\n%s", startErr.AppName, info, command)
 					}
 
 					// return the clear parsed error
@@ -201,7 +270,7 @@ If the new code is no longer compatible with the saved state, you can reset the 
 }
 
 func (c *Chain) setup() error {
-	fmt.Fprintf(c.stdLog().out, "Cosmos SDK's version is: %s\n\n", infoColor(c.Version))
+	c.ev.Sendf("Cosmos SDK's version is: %s\n", colors.Info(c.Version))
 
 	return c.checkSystem()
 }
@@ -220,6 +289,7 @@ func (c *Chain) refreshServe() {
 	if c.serveCancel != nil {
 		c.serveCancel()
 	}
+	// send event changes detected
 	c.serveRefresher <- struct{}{}
 }
 
@@ -235,14 +305,20 @@ func (c *Chain) watchAppBackend(ctx context.Context) error {
 		localfs.WatcherWorkdir(c.app.Path),
 		localfs.WatcherOnChange(c.refreshServe),
 		localfs.WatcherIgnoreHidden(),
+		localfs.WatcherIgnoreFolders(),
 		localfs.WatcherIgnoreExt(ignoredExts...),
 	)
 }
 
-// serve performs the operations to serve the blockchain: build, init and start
-// if the chain is already initialized and the file didn't changed, the app is directly started
-// if the files changed, the state is imported
-func (c *Chain) serve(ctx context.Context, forceReset bool) error {
+// serve performs the operations to serve the blockchain: build, init and start.
+// If the chain is already initialized and the file weren't changed, the app is directly started.
+// If the files changed, the state is imported.
+func (c *Chain) serve(
+	ctx context.Context,
+	cacheStorage cache.Storage,
+	buildTags []string,
+	forceReset, skipProto, generateClients bool,
+) error {
 	conf, err := c.Config()
 	if err != nil {
 		return &CannotBuildAppError{err}
@@ -253,13 +329,10 @@ func (c *Chain) serve(ctx context.Context, forceReset bool) error {
 		return err
 	}
 
-	saveDir, err := c.chainSavePath()
-	if err != nil {
-		return err
-	}
-
 	// isInit determines if the app is initialized
 	var isInit bool
+
+	dirCache := cache.New[[]byte](cacheStorage, serveDirchangeCacheNamespace)
 
 	// determine if the app must reset the state
 	// if the state must be reset, then we consider the chain as being not initialized
@@ -270,7 +343,7 @@ func (c *Chain) serve(ctx context.Context, forceReset bool) error {
 	if isInit {
 		configModified := false
 		if c.ConfigPath() != "" {
-			configModified, err = dirchange.HasDirChecksumChanged(c.app.Path, []string{c.ConfigPath()}, saveDir, configChecksum)
+			configModified, err = dirchange.HasDirChecksumChanged(dirCache, configChecksumKey, c.app.Path, c.ConfigPath())
 			if err != nil {
 				return err
 			}
@@ -278,14 +351,14 @@ func (c *Chain) serve(ctx context.Context, forceReset bool) error {
 
 		if forceReset || configModified {
 			// if forceReset is set, we consider the app as being not initialized
-			fmt.Fprintln(c.stdLog().out, "🔄 Resetting the app state...")
+			c.ev.Send("Resetting the app state...", events.ProgressUpdate())
 			isInit = false
 		}
 	}
 
 	// check if source has been modified since last serve
 	// if the state must not be reset but the source has changed, we rebuild the chain and import the exported state
-	sourceModified, err := dirchange.HasDirChecksumChanged(c.app.Path, appBackendSourceWatchPaths, saveDir, sourceChecksum)
+	sourceModified, err := dirchange.HasDirChecksumChanged(dirCache, sourceChecksumKey, c.app.Path, appBackendSourceWatchPaths...)
 	if err != nil {
 		return err
 	}
@@ -296,14 +369,14 @@ func (c *Chain) serve(ctx context.Context, forceReset bool) error {
 	if err != nil {
 		return err
 	}
-	binaryPath, err := exec.LookPath(binaryName)
+	binaryPath, err := xexec.ResolveAbsPath(binaryName)
 	if err != nil {
 		if !errors.Is(err, exec.ErrNotFound) {
 			return err
 		}
 		binaryModified = true
 	} else {
-		binaryModified, err = dirchange.HasDirChecksumChanged("", []string{binaryPath}, saveDir, binaryChecksum)
+		binaryModified, err = dirchange.HasDirChecksumChanged(dirCache, binaryChecksumKey, "", binaryPath)
 		if err != nil {
 			return err
 		}
@@ -326,23 +399,25 @@ func (c *Chain) serve(ctx context.Context, forceReset bool) error {
 	// build phase
 	if !isInit || appModified {
 		// build the blockchain app
-		if err := c.build(ctx, ""); err != nil {
+		if err := c.build(ctx, cacheStorage, buildTags, "", skipProto, generateClients, true); err != nil {
 			return err
 		}
 	}
 
 	// init phase
-	// nolint:gocritic
-	if !isInit || (appModified && !exportGenesisExists) {
-		fmt.Fprintln(c.stdLog().out, "💿 Initializing the app...")
+	initApp := !isInit || (appModified && !exportGenesisExists)
 
-		if err := c.Init(ctx, true); err != nil {
+	//nolint:gocritic
+	if initApp {
+		c.ev.Send("Initializing the app...", events.ProgressUpdate())
+
+		if err := c.Init(ctx, InitArgsAll); err != nil {
 			return err
 		}
 	} else if appModified {
 		// if the chain is already initialized but the source has been modified
 		// we reset the chain database and import the genesis state
-		fmt.Fprintln(c.stdLog().out, "💿 Existent genesis detected, restoring the database...")
+		c.ev.Send("Existent genesis detected, restoring the database...", events.ProgressUpdate())
 
 		if err := commands.UnsafeReset(ctx); err != nil {
 			return err
@@ -352,31 +427,45 @@ func (c *Chain) serve(ctx context.Context, forceReset bool) error {
 			return err
 		}
 	} else {
-		fmt.Fprintln(c.stdLog().out, "▶️  Restarting existing app...")
+		c.ev.Send("Restarting existing app...", events.ProgressUpdate())
 	}
 
 	// save checksums
 	if c.ConfigPath() != "" {
-		if err := dirchange.SaveDirChecksum(c.app.Path, []string{c.ConfigPath()}, saveDir, configChecksum); err != nil {
+		if err := dirchange.SaveDirChecksum(dirCache, configChecksumKey, c.app.Path, c.ConfigPath()); err != nil {
 			return err
 		}
 	}
-	if err := dirchange.SaveDirChecksum(c.app.Path, appBackendSourceWatchPaths, saveDir, sourceChecksum); err != nil {
+
+	if err := dirchange.SaveDirChecksum(dirCache, sourceChecksumKey, c.app.Path, appBackendSourceWatchPaths...); err != nil {
 		return err
 	}
-	binaryPath, err = exec.LookPath(binaryName)
-	if err != nil {
+
+	if err := dirchange.SaveDirChecksum(dirCache, binaryChecksumKey, "", binaryPath); err != nil {
 		return err
 	}
-	if err := dirchange.SaveDirChecksum("", []string{binaryPath}, saveDir, binaryChecksum); err != nil {
-		return err
+
+	// Display existing accounts if they were not initialized.
+	// Note that chain init displays accounts when the app is initialized.
+	if !initApp {
+		accounts, err := commands.ListAccounts(ctx)
+		if err != nil {
+			return err
+		}
+
+		var view accountview.Accounts
+		for _, a := range accounts {
+			view = view.Append(accountview.NewAccount(a.Name, a.Address))
+		}
+
+		c.ev.SendView(view, events.ProgressFinish())
 	}
 
 	// start the blockchain
 	return c.start(ctx, conf)
 }
 
-func (c *Chain) start(ctx context.Context, config chainconfig.Config) error {
+func (c *Chain) start(ctx context.Context, cfg *chainconfig.Config) error {
 	commands, err := c.Commands(ctx)
 	if err != nil {
 		return err
@@ -385,14 +474,14 @@ func (c *Chain) start(ctx context.Context, config chainconfig.Config) error {
 	g, ctx := errgroup.WithContext(ctx)
 
 	// start the blockchain.
-	g.Go(func() error { return c.plugin.Start(ctx, commands, config) })
+	g.Go(func() error { return c.Start(ctx, commands, cfg) })
 
 	// start the faucet if enabled.
 	faucet, err := c.Faucet(ctx)
-	isFaucetEnabled := err != ErrFaucetIsNotEnabled
+	isFaucetEnabled := !errors.Is(err, ErrFaucetIsNotEnabled)
 
 	if isFaucetEnabled {
-		if err == ErrFaucetAccountDoesNotExist {
+		if errors.Is(err, ErrFaucetAccountDoesNotExist) {
 			return &CannotBuildAppError{errors.Wrap(err, "faucet account doesn't exist")}
 		}
 		if err != nil {
@@ -410,30 +499,71 @@ func (c *Chain) start(ctx context.Context, config chainconfig.Config) error {
 	// set the app as being served
 	c.served = true
 
-	// print the server addresses.
-	fmt.Fprintf(c.stdLog().out, "🌍 Tendermint node: %s\n", xurl.HTTP(config.Host.RPC))
-	fmt.Fprintf(c.stdLog().out, "🌍 Blockchain API: %s\n", xurl.HTTP(config.Host.API))
+	validator, err := chainconfig.FirstValidator(cfg)
+	if err != nil {
+		return err
+	}
+
+	servers, err := validator.GetServers()
+	if err != nil {
+		return err
+	}
+
+	// note: address format errors are handled by the
+	// error group, so they can be safely ignored here
+
+	rpcAddr, _ := xurl.HTTP(servers.RPC.Address)
+	apiAddr, _ := xurl.HTTP(servers.API.Address)
+
+	c.ev.Send(
+		fmt.Sprintf("Tendermint node: %s", rpcAddr),
+		events.Icon(icons.Earth),
+		events.ProgressFinish(),
+	)
+	c.ev.Send(
+		fmt.Sprintf("Blockchain API: %s", apiAddr),
+		events.Icon(icons.Earth),
+	)
 
 	if isFaucetEnabled {
-		fmt.Fprintf(c.stdLog().out, "🌍 Token faucet: %s\n", xurl.HTTP(chainconfig.FaucetHost(config)))
+		faucetAddr, _ := xurl.HTTP(chainconfig.FaucetHost(cfg))
+
+		c.ev.Send(
+			fmt.Sprintf("Token faucet: %s", faucetAddr),
+			events.Icon(icons.Earth),
+		)
 	}
+
+	appHome, _ := c.Home()
+	appBin, _ := c.AbsBinaryPath()
+
+	c.ev.Send(
+		fmt.Sprintf("Data directory: %s", colors.Faint(appHome)),
+		events.Icon(icons.Bullet),
+		events.Group(EvtGroupPath),
+	)
+	c.ev.Send(
+		fmt.Sprintf("App binary: %s", colors.Faint(appBin)),
+		events.Icon(icons.Bullet),
+		events.Group(EvtGroupPath),
+	)
 
 	return g.Wait()
 }
 
 func (c *Chain) runFaucetServer(ctx context.Context, faucet cosmosfaucet.Faucet) error {
-	config, err := c.Config()
+	cfg, err := c.Config()
 	if err != nil {
 		return err
 	}
 
 	return xhttp.Serve(ctx, &http.Server{
-		Addr:    chainconfig.FaucetHost(config),
+		Addr:    chainconfig.FaucetHost(cfg),
 		Handler: faucet,
 	})
 }
 
-// saveChainState runs the export command of the chain and store the exported genesis in the chain saved config
+// saveChainState runs the export command of the chain and store the exported genesis in the chain saved config.
 func (c *Chain) saveChainState(ctx context.Context, commands chaincmdrunner.Runner) error {
 	genesisPath, err := c.exportedGenesisPath()
 	if err != nil {
@@ -443,7 +573,7 @@ func (c *Chain) saveChainState(ctx context.Context, commands chaincmdrunner.Runn
 	return commands.Export(ctx, genesisPath)
 }
 
-// importChainState imports the saved genesis in chain config to use it as the genesis
+// importChainState imports the saved genesis in chain config to use it as the genesis.
 func (c *Chain) importChainState() error {
 	exportGenesisPath, err := c.exportedGenesisPath()
 	if err != nil {
@@ -457,8 +587,8 @@ func (c *Chain) importChainState() error {
 	return copy.Copy(exportGenesisPath, genesisPath)
 }
 
-// chainSavePath returns the path where the chain state is saved
-// create the path if it doesn't exist
+// chainSavePath returns the path where the chain state is saved.
+// Creates the path if it doesn't exist.
 func (c *Chain) chainSavePath() (string, error) {
 	savePath, err := starportSavePath()
 	if err != nil {
@@ -472,14 +602,14 @@ func (c *Chain) chainSavePath() (string, error) {
 	chainSavePath := filepath.Join(savePath, chainID)
 
 	// ensure the path exists
-	if err := os.MkdirAll(savePath, 0700); err != nil && !os.IsExist(err) {
+	if err := os.MkdirAll(savePath, 0o700); err != nil && !os.IsExist(err) {
 		return "", err
 	}
 
 	return chainSavePath, nil
 }
 
-// exportedGenesisPath returns the path of the exported genesis file
+// exportedGenesisPath returns the path of the exported genesis file.
 func (c *Chain) exportedGenesisPath() (string, error) {
 	savePath, err := c.chainSavePath()
 	if err != nil {
@@ -494,7 +624,13 @@ type CannotBuildAppError struct {
 }
 
 func (e *CannotBuildAppError) Error() string {
-	return fmt.Sprintf("cannot build app:\n\n\t%s", e.Err)
+	// TODO: Find at which point the error is wrapped twice
+	var buildErr *CannotBuildAppError
+	if errors.As(e.Err, &buildErr) {
+		return buildErr.Error()
+	}
+
+	return fmt.Sprintf("cannot build app:\n\n%s", e.Err)
 }
 
 func (e *CannotBuildAppError) Unwrap() error {
@@ -514,9 +650,9 @@ func (e *CannotStartAppError) Unwrap() error {
 	return e.Err
 }
 
-// ParseStartError parses the error into a clear error string
-// The error logs from Cosmos SDK application are too extensive to be directly printed
-// If the error is not recognized, returns an empty string
+// ParseStartError parses the error into a clear error string.
+// The error logs from Cosmos SDK application are too extensive to be directly printed.
+// If the error is not recognized, returns an empty string.
 func (e *CannotStartAppError) ParseStartError() string {
 	errorLogs := errors.Unwrap(e.Err).Error()
 	switch {

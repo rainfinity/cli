@@ -12,11 +12,13 @@ import (
 	"github.com/cosmos/cosmos-sdk/client/debug"
 	"github.com/cosmos/cosmos-sdk/client/flags"
 	"github.com/cosmos/cosmos-sdk/client/keys"
+	"github.com/cosmos/cosmos-sdk/client/pruning"
 	"github.com/cosmos/cosmos-sdk/client/rpc"
 	"github.com/cosmos/cosmos-sdk/server"
 	serverconfig "github.com/cosmos/cosmos-sdk/server/config"
 	servertypes "github.com/cosmos/cosmos-sdk/server/types"
 	"github.com/cosmos/cosmos-sdk/snapshots"
+	snapshottypes "github.com/cosmos/cosmos-sdk/snapshots/types"
 	"github.com/cosmos/cosmos-sdk/store"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/types/module"
@@ -28,13 +30,14 @@ import (
 	"github.com/spf13/cast"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	tmcfg "github.com/tendermint/tendermint/config"
 	tmcli "github.com/tendermint/tendermint/libs/cli"
 	"github.com/tendermint/tendermint/libs/log"
 	dbm "github.com/tendermint/tm-db"
 )
 
 type (
-	// AppBuilder is a method that allows to build an app
+	// AppBuilder is a method that allows to build an app.
 	AppBuilder func(
 		logger log.Logger,
 		db dbm.DB,
@@ -48,13 +51,13 @@ type (
 		baseAppOptions ...func(*baseapp.BaseApp),
 	) App
 
-	// App represents a Cosmos SDK application that can be run as a server and with an exportable state
+	// App represents a Cosmos SDK application that can be run as a server and with an exportable state.
 	App interface {
 		servertypes.Application
 		ExportableApp
 	}
 
-	// ExportableApp represents an app with an exportable state
+	// ExportableApp represents an app with an exportable state.
 	ExportableApp interface {
 		ExportAppStateAndValidators(
 			forZeroHeight bool,
@@ -63,7 +66,7 @@ type (
 		LoadHeight(height int64) error
 	}
 
-	// appCreator is an app creator
+	// appCreator is an app creator.
 	appCreator struct {
 		encodingConfig EncodingConfig
 		buildApp       AppBuilder
@@ -113,7 +116,7 @@ func WithEnvPrefix(envPrefix string) Option {
 	}
 }
 
-// NewRootCmd creates a new root command for a Cosmos SDK application
+// NewRootCmd creates a new root command for a Cosmos SDK application.
 func NewRootCmd(
 	appName,
 	accountAddressPrefix,
@@ -142,11 +145,12 @@ func NewRootCmd(
 
 	rootCmd := &cobra.Command{
 		Use:   appName + "d",
-		Short: "Stargate CosmosHub App",
+		Short: "Cosmos SDK App",
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			// set the default command outputs
 			cmd.SetOut(cmd.OutOrStdout())
 			cmd.SetErr(cmd.ErrOrStderr())
+
 			initClientCtx, err := client.ReadPersistentCommandFlags(initClientCtx, cmd.Flags())
 			if err != nil {
 				return err
@@ -162,12 +166,11 @@ func NewRootCmd(
 
 			customAppTemplate, customAppConfig := initAppConfig()
 
-			if err := server.InterceptConfigsPreRunHandler(cmd, customAppTemplate, customAppConfig); err != nil {
+			if err := server.InterceptConfigsPreRunHandler(cmd, customAppTemplate, customAppConfig, tmcfg.DefaultConfig()); err != nil {
 				return err
-
 			}
 
-			startProxyForTunneledPeers(initClientCtx, cmd)
+			// startProxyForTunneledPeers(initClientCtx, cmd)
 
 			return nil
 		},
@@ -197,6 +200,11 @@ func initRootCmd(
 	buildApp AppBuilder,
 	options rootOptions,
 ) {
+	a := appCreator{
+		encodingConfig,
+		buildApp,
+	}
+
 	rootCmd.AddCommand(
 		genutilcli.InitCmd(moduleBasics, defaultNodeHome),
 		genutilcli.CollectGenTxsCmd(banktypes.GenesisBalancesIterator{}, defaultNodeHome),
@@ -212,12 +220,8 @@ func initRootCmd(
 		tmcli.NewCompletionCmd(rootCmd, true),
 		debug.Cmd(),
 		config.Cmd(),
+		pruning.PruningCmd(a.newApp),
 	)
-
-	a := appCreator{
-		encodingConfig,
-		buildApp,
-	}
 
 	// add server commands
 	server.AddCommands(
@@ -248,7 +252,7 @@ func initRootCmd(
 	}
 }
 
-// queryCommand returns the sub-command to send queries to the app
+// queryCommand returns the sub-command to send queries to the app.
 func queryCommand(moduleBasics module.BasicManager) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:                        "query",
@@ -273,7 +277,7 @@ func queryCommand(moduleBasics module.BasicManager) *cobra.Command {
 	return cmd
 }
 
-// txCommand returns the sub-command to send transactions to the app
+// txCommand returns the sub-command to send transactions to the app.
 func txCommand(moduleBasics module.BasicManager) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:                        "tx",
@@ -320,7 +324,7 @@ func overwriteFlagDefaults(c *cobra.Command, defaults map[string]string) {
 	}
 }
 
-// newApp creates a new Cosmos SDK app
+// newApp creates a new Cosmos SDK app.
 func (a appCreator) newApp(
 	logger log.Logger,
 	db dbm.DB,
@@ -344,7 +348,7 @@ func (a appCreator) newApp(
 	}
 
 	snapshotDir := filepath.Join(cast.ToString(appOpts.Get(flags.FlagHome)), "data", "snapshots")
-	snapshotDB, err := sdk.NewLevelDB("metadata", snapshotDir)
+	snapshotDB, err := dbm.NewDB("metadata", dbm.GoLevelDBBackend, snapshotDir)
 	if err != nil {
 		panic(err)
 	}
@@ -352,6 +356,11 @@ func (a appCreator) newApp(
 	if err != nil {
 		panic(err)
 	}
+
+	snapshotOptions := snapshottypes.NewSnapshotOptions(
+		cast.ToUint64(appOpts.Get(server.FlagStateSyncSnapshotInterval)),
+		cast.ToUint32(appOpts.Get(server.FlagStateSyncSnapshotKeepRecent)),
+	)
 
 	return a.buildApp(
 		logger,
@@ -371,13 +380,13 @@ func (a appCreator) newApp(
 		baseapp.SetInterBlockCache(cache),
 		baseapp.SetTrace(cast.ToBool(appOpts.Get(server.FlagTrace))),
 		baseapp.SetIndexEvents(cast.ToStringSlice(appOpts.Get(server.FlagIndexEvents))),
-		baseapp.SetSnapshotStore(snapshotStore),
-		baseapp.SetSnapshotInterval(cast.ToUint64(appOpts.Get(server.FlagStateSyncSnapshotInterval))),
-		baseapp.SetSnapshotKeepRecent(cast.ToUint32(appOpts.Get(server.FlagStateSyncSnapshotKeepRecent))),
+		baseapp.SetSnapshot(snapshotStore, snapshotOptions),
+		baseapp.SetIAVLCacheSize(cast.ToInt(appOpts.Get(server.FlagIAVLCacheSize))),
+		baseapp.SetIAVLDisableFastNode(cast.ToBool(appOpts.Get(server.FlagDisableIAVLFastNode))),
 	)
 }
 
-// appExport creates a new simapp (optionally at a given height)
+// appExport creates a new simapp (optionally at a given height).
 func (a appCreator) appExport(
 	logger log.Logger,
 	db dbm.DB,
@@ -387,7 +396,6 @@ func (a appCreator) appExport(
 	jailAllowedAddrs []string,
 	appOpts servertypes.AppOptions,
 ) (servertypes.ExportedApp, error) {
-
 	var exportableApp ExportableApp
 
 	homePath, ok := appOpts.Get(flags.FlagHome).(string)

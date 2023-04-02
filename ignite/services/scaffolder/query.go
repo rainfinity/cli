@@ -4,18 +4,20 @@ import (
 	"context"
 	"errors"
 
-	"github.com/gobuffalo/genny"
+	"github.com/gobuffalo/genny/v2"
 
-	"github.com/ignite-hq/cli/ignite/pkg/multiformatname"
-	"github.com/ignite-hq/cli/ignite/pkg/placeholder"
-	"github.com/ignite-hq/cli/ignite/pkg/xgenny"
-	"github.com/ignite-hq/cli/ignite/templates/field"
-	"github.com/ignite-hq/cli/ignite/templates/query"
+	"github.com/ignite/cli/ignite/pkg/cache"
+	"github.com/ignite/cli/ignite/pkg/multiformatname"
+	"github.com/ignite/cli/ignite/pkg/placeholder"
+	"github.com/ignite/cli/ignite/pkg/xgenny"
+	"github.com/ignite/cli/ignite/templates/field"
+	"github.com/ignite/cli/ignite/templates/query"
 )
 
-// AddQuery adds a new query to scaffolded app
+// AddQuery adds a new query to scaffolded app.
 func (s Scaffolder) AddQuery(
 	ctx context.Context,
+	cacheStorage cache.Storage,
 	tracer *placeholder.Tracer,
 	moduleName,
 	queryName,
@@ -44,7 +46,7 @@ func (s Scaffolder) AddQuery(
 	}
 
 	// Check and parse provided request fields
-	if ok := containCustomTypes(reqFields); ok {
+	if ok := containsCustomTypes(reqFields); ok {
 		return sm, errors.New("query request params can't contain custom type")
 	}
 	parsedReqFields, err := field.ParseFields(reqFields, checkGoReservedWord)
@@ -53,7 +55,7 @@ func (s Scaffolder) AddQuery(
 	}
 
 	// Check and parse provided response fields
-	if err := checkCustomTypes(ctx, s.path, moduleName, resFields); err != nil {
+	if err := checkCustomTypes(ctx, s.path, s.modpath.Package, moduleName, resFields); err != nil {
 		return sm, err
 	}
 	parsedResFields, err := field.ParseFields(resFields, checkGoReservedWord)
@@ -68,7 +70,6 @@ func (s Scaffolder) AddQuery(
 			AppPath:     s.path,
 			ModulePath:  s.modpath.RawPath,
 			ModuleName:  moduleName,
-			OwnerName:   owner(s.modpath.RawPath),
 			QueryName:   name,
 			ReqFields:   parsedReqFields,
 			ResFields:   parsedResFields,
@@ -78,7 +79,7 @@ func (s Scaffolder) AddQuery(
 	)
 
 	// Scaffold
-	g, err = query.NewStargate(tracer, opts)
+	g, err = query.NewGenerator(tracer, opts)
 	if err != nil {
 		return sm, err
 	}
@@ -86,5 +87,5 @@ func (s Scaffolder) AddQuery(
 	if err != nil {
 		return sm, err
 	}
-	return sm, finish(opts.AppPath, s.modpath.RawPath)
+	return sm, finish(ctx, cacheStorage, opts.AppPath, s.modpath.RawPath)
 }

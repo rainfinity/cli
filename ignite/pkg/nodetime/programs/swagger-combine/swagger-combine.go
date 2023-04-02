@@ -7,8 +7,8 @@ import (
 	"os"
 	"regexp"
 
-	"github.com/ignite-hq/cli/ignite/pkg/cmdrunner/exec"
-	"github.com/ignite-hq/cli/ignite/pkg/nodetime"
+	"github.com/ignite/cli/ignite/pkg/cmdrunner/exec"
+	"github.com/ignite/cli/ignite/pkg/nodetime"
 )
 
 // Config represent swagger-combine config.
@@ -61,7 +61,7 @@ func (c *Config) AddSpec(id, path string) error {
 		rename[o] = id + o
 	}
 
-	// add api with replaced operantion ids.
+	// add api with replaced operation ids.
 	c.APIs = append(c.APIs, API{
 		ID:           id,
 		URL:          path,

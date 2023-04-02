@@ -1,8 +1,8 @@
 package message
 
 import (
-	"github.com/ignite-hq/cli/ignite/pkg/multiformatname"
-	"github.com/ignite-hq/cli/ignite/templates/field"
+	"github.com/ignite/cli/ignite/pkg/multiformatname"
+	"github.com/ignite/cli/ignite/templates/field"
 )
 
 // Options ...
@@ -11,7 +11,6 @@ type Options struct {
 	AppPath      string
 	ModuleName   string
 	ModulePath   string
-	OwnerName    string
 	MsgName      multiformatname.Name
 	MsgSigner    multiformatname.Name
 	MsgDesc      string
@@ -20,7 +19,7 @@ type Options struct {
 	NoSimulation bool
 }
 
-// Validate that options are usuable
+// Validate that options are usable.
 func (opts *Options) Validate() error {
 	return nil
 }

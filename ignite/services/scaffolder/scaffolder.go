@@ -1,41 +1,53 @@
-// Package scaffolder initializes Starport apps and modifies existing ones
+// Package scaffolder initializes Ignite CLI apps and modifies existing ones
 // to add more features in a later time.
 package scaffolder
 
 import (
 	"context"
-	"os"
+	"fmt"
 	"path/filepath"
-	"strings"
 
-	"github.com/ignite-hq/cli/ignite/chainconfig"
-	sperrors "github.com/ignite-hq/cli/ignite/errors"
-	"github.com/ignite-hq/cli/ignite/pkg/cmdrunner"
-	"github.com/ignite-hq/cli/ignite/pkg/cmdrunner/step"
-	"github.com/ignite-hq/cli/ignite/pkg/cosmosanalysis"
-	"github.com/ignite-hq/cli/ignite/pkg/cosmosanalysis/module"
-	"github.com/ignite-hq/cli/ignite/pkg/cosmosgen"
-	"github.com/ignite-hq/cli/ignite/pkg/cosmosver"
-	"github.com/ignite-hq/cli/ignite/pkg/giturl"
-	"github.com/ignite-hq/cli/ignite/pkg/gocmd"
-	"github.com/ignite-hq/cli/ignite/pkg/gomodule"
-	"github.com/ignite-hq/cli/ignite/pkg/gomodulepath"
+	chainconfig "github.com/ignite/cli/ignite/config/chain"
+	"github.com/ignite/cli/ignite/pkg/cache"
+	"github.com/ignite/cli/ignite/pkg/cosmosanalysis"
+	"github.com/ignite/cli/ignite/pkg/cosmosgen"
+	"github.com/ignite/cli/ignite/pkg/cosmosver"
+	"github.com/ignite/cli/ignite/pkg/gocmd"
+	"github.com/ignite/cli/ignite/pkg/gomodulepath"
 )
 
-// Scaffolder is Starport app scaffolder.
+// Scaffolder is Ignite CLI app scaffolder.
 type Scaffolder struct {
+	// Version of the chain
+	Version cosmosver.Version
+
 	// path of the app.
 	path string
 
 	// modpath represents the go module path of the app.
 	modpath gomodulepath.Path
-
-	// Version of the chain
-	Version cosmosver.Version
 }
 
-// App creates a new scaffolder for an existent app.
-func App(path string) (Scaffolder, error) {
+// New creates a new scaffold app.
+func New(appPath string) (Scaffolder, error) {
+	sc, err := new(appPath)
+	if err != nil {
+		return sc, err
+	}
+
+	if sc.Version.LT(cosmosver.StargateFortyFourVersion) {
+		return sc, fmt.Errorf(
+			`⚠️ Your chain has been scaffolded with an old version of Cosmos SDK: %[1]v.
+Please, follow the migration guide to upgrade your chain to the latest version:
+
+https://docs.ignite.com/migration`, sc.Version.String(),
+		)
+	}
+	return sc, nil
+}
+
+// new creates a new scaffolder for an existent app.
+func new(path string) (Scaffolder, error) {
 	path, err := filepath.Abs(path)
 	if err != nil {
 		return Scaffolder{}, err
@@ -45,11 +57,7 @@ func App(path string) (Scaffolder, error) {
 	if err != nil {
 		return Scaffolder{}, err
 	}
-	modfile, err := gomodule.ParseAt(path)
-	if err != nil {
-		return Scaffolder{}, err
-	}
-	if err := cosmosanalysis.ValidateGoMod(modfile); err != nil {
+	if err := cosmosanalysis.IsChainPath(path); err != nil {
 		return Scaffolder{}, err
 	}
 
@@ -58,35 +66,27 @@ func App(path string) (Scaffolder, error) {
 		return Scaffolder{}, err
 	}
 
-	if !version.IsFamily(cosmosver.Stargate) {
-		return Scaffolder{}, sperrors.ErrOnlyStargateSupported
-	}
-
 	s := Scaffolder{
+		Version: version,
 		path:    path,
 		modpath: modpath,
-		Version: version,
 	}
 
 	return s, nil
 }
 
-func owner(modulePath string) string {
-	return strings.Split(modulePath, "/")[1]
-}
-
-func finish(path, gomodPath string) error {
-	if err := protoc(path, gomodPath); err != nil {
+func finish(ctx context.Context, cacheStorage cache.Storage, path, gomodPath string) error {
+	if err := protoc(ctx, cacheStorage, path, gomodPath); err != nil {
 		return err
 	}
-	if err := tidy(path); err != nil {
+	if err := gocmd.ModTidy(ctx, path); err != nil {
 		return err
 	}
-	return fmtProject(path)
+	return gocmd.Fmt(ctx, path)
 }
 
-func protoc(projectPath, gomodPath string) error {
-	if err := cosmosgen.InstallDependencies(context.Background(), projectPath); err != nil {
+func protoc(ctx context.Context, cacheStorage cache.Storage, projectPath, gomodPath string) error {
+	if err := cosmosgen.InstallDepTools(ctx, projectPath); err != nil {
 		return err
 	}
 
@@ -104,54 +104,45 @@ func protoc(projectPath, gomodPath string) error {
 		cosmosgen.IncludeDirs(conf.Build.Proto.ThirdPartyPaths),
 	}
 
-	// generate Vuex code as well if it is enabled.
-	if conf.Client.Vuex.Path != "" {
-		storeRootPath := filepath.Join(projectPath, conf.Client.Vuex.Path, "generated")
+	// Generate Typescript client code if it's enabled or when Vuex stores are generated
+	if conf.Client.Typescript.Path != "" || conf.Client.Vuex.Path != "" { //nolint:staticcheck,nolintlint
+		tsClientPath := chainconfig.TSClientPath(*conf)
+		if !filepath.IsAbs(tsClientPath) {
+			tsClientPath = filepath.Join(projectPath, tsClientPath)
+		}
+
+		options = append(options,
+			cosmosgen.WithTSClientGeneration(
+				cosmosgen.TypescriptModulePath(tsClientPath),
+				tsClientPath,
+				true,
+			),
+		)
+	}
+
+	if vuexPath := conf.Client.Vuex.Path; vuexPath != "" { //nolint:staticcheck,nolintlint
+		if filepath.IsAbs(vuexPath) {
+			vuexPath = filepath.Join(vuexPath, "generated")
+		} else {
+			vuexPath = filepath.Join(projectPath, vuexPath, "generated")
+		}
 
 		options = append(options,
 			cosmosgen.WithVuexGeneration(
-				false,
-				func(m module.Module) string {
-					parsedGitURL, _ := giturl.Parse(m.Pkg.GoImportName)
-					return filepath.Join(storeRootPath, parsedGitURL.UserAndRepo(), m.Pkg.Name, "module")
-				},
-				storeRootPath,
+				cosmosgen.TypescriptModulePath(vuexPath),
+				vuexPath,
 			),
 		)
 	}
+
 	if conf.Client.OpenAPI.Path != "" {
-		options = append(options, cosmosgen.WithOpenAPIGeneration(conf.Client.OpenAPI.Path))
+		openAPIPath := conf.Client.OpenAPI.Path
+		if !filepath.IsAbs(openAPIPath) {
+			openAPIPath = filepath.Join(projectPath, openAPIPath)
+		}
+
+		options = append(options, cosmosgen.WithOpenAPIGeneration(openAPIPath))
 	}
 
-	return cosmosgen.Generate(context.Background(), projectPath, conf.Build.Proto.Path, options...)
-}
-
-func tidy(path string) error {
-	return cmdrunner.
-		New(
-			cmdrunner.DefaultStderr(os.Stderr),
-			cmdrunner.DefaultWorkdir(path),
-		).
-		Run(context.Background(),
-			step.New(
-				step.Exec(gocmd.Name(), "mod", "tidy"),
-			),
-		)
-}
-
-func fmtProject(path string) error {
-	return cmdrunner.
-		New(
-			cmdrunner.DefaultStderr(os.Stderr),
-			cmdrunner.DefaultWorkdir(path),
-		).
-		Run(context.Background(),
-			step.New(
-				step.Exec(
-					gocmd.Name(),
-					"fmt",
-					"./...",
-				),
-			),
-		)
+	return cosmosgen.Generate(ctx, cacheStorage, projectPath, conf.Build.Proto.Path, options...)
 }

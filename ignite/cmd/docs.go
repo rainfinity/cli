@@ -3,9 +3,9 @@ package ignitecmd
 import (
 	"github.com/spf13/cobra"
 
-	"github.com/ignite-hq/cli/docs"
-	"github.com/ignite-hq/cli/ignite/pkg/localfs"
-	"github.com/ignite-hq/cli/ignite/pkg/markdownviewer"
+	"github.com/ignite/cli/docs"
+	"github.com/ignite/cli/ignite/pkg/localfs"
+	"github.com/ignite/cli/ignite/pkg/markdownviewer"
 )
 
 func NewDocs() *cobra.Command {
@@ -18,7 +18,7 @@ func NewDocs() *cobra.Command {
 	return c
 }
 
-func docsHandler(cmd *cobra.Command, args []string) error {
+func docsHandler(*cobra.Command, []string) error {
 	path, cleanup, err := localfs.SaveTemp(docs.Docs)
 	if err != nil {
 		return err

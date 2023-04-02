@@ -4,46 +4,48 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/gobuffalo/genny"
-	"github.com/gobuffalo/plush"
-	"github.com/gobuffalo/plushgen"
+	"github.com/gobuffalo/genny/v2"
+	"github.com/gobuffalo/plush/v4"
 
-	"github.com/ignite-hq/cli/ignite/pkg/placeholder"
-	"github.com/ignite-hq/cli/ignite/pkg/xgenny"
-	"github.com/ignite-hq/cli/ignite/pkg/xstrings"
-	"github.com/ignite-hq/cli/ignite/templates/field/plushhelpers"
-	"github.com/ignite-hq/cli/ignite/templates/module"
-	"github.com/ignite-hq/cli/ignite/templates/typed"
+	"github.com/ignite/cli/ignite/pkg/gomodulepath"
+	"github.com/ignite/cli/ignite/pkg/placeholder"
+	"github.com/ignite/cli/ignite/pkg/protoanalysis/protoutil"
+	"github.com/ignite/cli/ignite/pkg/xgenny"
+	"github.com/ignite/cli/ignite/pkg/xstrings"
+	"github.com/ignite/cli/ignite/templates/field/plushhelpers"
+	"github.com/ignite/cli/ignite/templates/module"
+	"github.com/ignite/cli/ignite/templates/typed"
 )
 
-// NewIBC returns the generator to scaffold the implementation of the IBCModule interface inside a module
+// NewIBC returns the generator to scaffold the implementation of the IBCModule interface inside a module.
 func NewIBC(replacer placeholder.Replacer, opts *CreateOptions) (*genny.Generator, error) {
 	var (
 		g        = genny.New()
-		template = xgenny.NewEmbedWalker(fsIBC, "ibc/", opts.AppPath)
+		template = xgenny.NewEmbedWalker(fsIBC, "files/ibc/", opts.AppPath)
 	)
 
 	g.RunFn(genesisModify(replacer, opts))
 	g.RunFn(genesisTypesModify(replacer, opts))
-	g.RunFn(genesisProtoModify(replacer, opts))
+	g.RunFn(genesisProtoModify(opts))
 	g.RunFn(keysModify(replacer, opts))
 
 	if err := g.Box(template); err != nil {
 		return g, err
 	}
+
+	appModulePath := gomodulepath.ExtractAppPath(opts.ModulePath)
+
 	ctx := plush.NewContext()
 	ctx.Set("moduleName", opts.ModuleName)
 	ctx.Set("modulePath", opts.ModulePath)
 	ctx.Set("appName", opts.AppName)
-	ctx.Set("ownerName", opts.OwnerName)
 	ctx.Set("ibcOrdering", opts.IBCOrdering)
 	ctx.Set("dependencies", opts.Dependencies)
-
-	// Used for proto package name
-	ctx.Set("formatOwnerName", xstrings.FormatUsername)
+	ctx.Set("protoPkgName", module.ProtoPackageName(appModulePath, opts.ModuleName))
 
 	plushhelpers.ExtendPlushContext(ctx)
-	g.Transformer(plushgen.Transformer(ctx))
+	g.Transformer(xgenny.Transformer(ctx))
+	g.Transformer(genny.Replace("{{appName}}", opts.AppName))
 	g.Transformer(genny.Replace("{{moduleName}}", opts.ModuleName))
 	return g, nil
 }
@@ -92,7 +94,7 @@ func genesisTypesModify(replacer placeholder.Replacer, opts *CreateOptions) genn
 		}
 
 		// Import
-		templateImport := `host "github.com/cosmos/ibc-go/v2/modules/core/24-host"
+		templateImport := `host "github.com/cosmos/ibc-go/v6/modules/core/24-host"
 %s`
 		replacementImport := fmt.Sprintf(templateImport, typed.PlaceholderGenesisTypesImport)
 		content := replacer.Replace(f.String(), typed.PlaceholderGenesisTypesImport, replacementImport)
@@ -117,23 +119,32 @@ func genesisTypesModify(replacer placeholder.Replacer, opts *CreateOptions) genn
 	}
 }
 
-func genesisProtoModify(replacer placeholder.Replacer, opts *CreateOptions) genny.RunFn {
+// Modifies genesis.proto to add a new field.
+//
+// What it depends on:
+//   - Existence of a message named 'GenesisState' in genesis.proto.
+func genesisProtoModify(opts *CreateOptions) genny.RunFn {
 	return func(r *genny.Runner) error {
-		path := filepath.Join(opts.AppPath, "proto", opts.ModuleName, "genesis.proto")
+		path := filepath.Join(opts.AppPath, "proto", opts.AppName, opts.ModuleName, "genesis.proto")
 		f, err := r.Disk.Find(path)
 		if err != nil {
 			return err
 		}
+		protoFile, err := protoutil.ParseProtoFile(f)
+		if err != nil {
+			return err
+		}
 
-		// Determine the new field number
-		content := f.String()
+		// Grab GenesisState and add next (always 2, I gather) available field.
+		// TODO: typed.ProtoGenesisStateMessage exists but in subfolder, so we can't use it here, refactor?
+		genesisState, err := protoutil.GetMessageByName(protoFile, "GenesisState")
+		if err != nil {
+			return fmt.Errorf("couldn't find message 'GenesisState' in %s: %w", path, err)
+		}
+		field := protoutil.NewField("port_id", "string", protoutil.NextUniqueID(genesisState))
+		protoutil.Append(genesisState, field)
 
-		template := `string port_id = 2;
-  %s`
-		replacement := fmt.Sprintf(template, typed.PlaceholderGenesisProtoState)
-		content = replacer.Replace(content, typed.PlaceholderGenesisProtoState, replacement)
-
-		newFile := genny.NewFileS(path, content)
+		newFile := genny.NewFileS(path, protoutil.Print(protoFile))
 		return r.File(newFile)
 	}
 }
@@ -176,15 +187,26 @@ func appIBCModify(replacer placeholder.Replacer, opts *CreateOptions) genny.RunF
 			return err
 		}
 
+		// create IBC module
+		templateIBCModule := `%[2]vIBCModule := %[2]vmodule.NewIBCModule(app.%[3]vKeeper)
+%[1]v`
+		replacementIBCModule := fmt.Sprintf(
+			templateIBCModule,
+			module.PlaceholderSgAppKeeperDefinition,
+			opts.ModuleName,
+			xstrings.Title(opts.ModuleName),
+		)
+		content := replacer.Replace(f.String(), module.PlaceholderSgAppKeeperDefinition, replacementIBCModule)
+
 		// Add route to IBC router
-		templateRouter := `ibcRouter.AddRoute(%[2]vmoduletypes.ModuleName, %[2]vModule)
+		templateRouter := `ibcRouter.AddRoute(%[2]vmoduletypes.ModuleName, %[2]vIBCModule)
 %[1]v`
 		replacementRouter := fmt.Sprintf(
 			templateRouter,
 			module.PlaceholderIBCAppRouter,
 			opts.ModuleName,
 		)
-		content := replacer.Replace(f.String(), module.PlaceholderIBCAppRouter, replacementRouter)
+		content = replacer.Replace(content, module.PlaceholderIBCAppRouter, replacementRouter)
 
 		// Scoped keeper declaration for the module
 		templateScopedKeeperDeclaration := `Scoped%[1]vKeeper capabilitykeeper.ScopedKeeper`

@@ -5,19 +5,20 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/gobuffalo/genny"
+	"github.com/gobuffalo/genny/v2"
 
-	"github.com/ignite-hq/cli/ignite/pkg/multiformatname"
-	"github.com/ignite-hq/cli/ignite/pkg/placeholder"
-	"github.com/ignite-hq/cli/ignite/pkg/xgenny"
-	"github.com/ignite-hq/cli/ignite/templates/field"
-	"github.com/ignite-hq/cli/ignite/templates/field/datatype"
-	modulecreate "github.com/ignite-hq/cli/ignite/templates/module/create"
-	"github.com/ignite-hq/cli/ignite/templates/typed"
-	"github.com/ignite-hq/cli/ignite/templates/typed/dry"
-	"github.com/ignite-hq/cli/ignite/templates/typed/list"
-	maptype "github.com/ignite-hq/cli/ignite/templates/typed/map"
-	"github.com/ignite-hq/cli/ignite/templates/typed/singleton"
+	"github.com/ignite/cli/ignite/pkg/cache"
+	"github.com/ignite/cli/ignite/pkg/multiformatname"
+	"github.com/ignite/cli/ignite/pkg/placeholder"
+	"github.com/ignite/cli/ignite/pkg/xgenny"
+	"github.com/ignite/cli/ignite/templates/field"
+	"github.com/ignite/cli/ignite/templates/field/datatype"
+	modulecreate "github.com/ignite/cli/ignite/templates/module/create"
+	"github.com/ignite/cli/ignite/templates/typed"
+	"github.com/ignite/cli/ignite/templates/typed/dry"
+	"github.com/ignite/cli/ignite/templates/typed/list"
+	maptype "github.com/ignite/cli/ignite/templates/typed/map"
+	"github.com/ignite/cli/ignite/templates/typed/singleton"
 )
 
 // AddTypeOption configures options for AddType.
@@ -41,7 +42,7 @@ type addTypeOptions struct {
 	signer            string
 }
 
-// newAddTypeOptions returns a addTypeOptions with default options
+// newAddTypeOptions returns a addTypeOptions with default options.
 func newAddTypeOptions(moduleName string) addTypeOptions {
 	return addTypeOptions{
 		moduleName: moduleName,
@@ -105,7 +106,7 @@ func TypeWithoutSimulation() AddTypeOption {
 	}
 }
 
-// TypeWithSigner provides a custom signer name for the message
+// TypeWithSigner provides a custom signer name for the message.
 func TypeWithSigner(signer string) AddTypeOption {
 	return func(o *addTypeOptions) {
 		o.signer = signer
@@ -113,11 +114,12 @@ func TypeWithSigner(signer string) AddTypeOption {
 }
 
 // AddType adds a new type to a scaffolded app.
-// if non of the list, map or singleton given, a dry type without anything extra (like a storage layer, models, CLI etc.)
+// if none of the list, map or singleton given, a dry type without anything extra (like a storage layer, models, CLI etc.)
 // will be scaffolded.
 // if no module is given, the type will be scaffolded inside the app's default module.
 func (s Scaffolder) AddType(
 	ctx context.Context,
+	cacheStorage cache.Storage,
 	typeName string,
 	tracer *placeholder.Tracer,
 	kind AddTypeKind,
@@ -144,16 +146,11 @@ func (s Scaffolder) AddType(
 		return sm, err
 	}
 
-	signer := ""
-	if !o.withoutMessage {
-		signer = o.signer
-	}
-
 	// Check and parse provided fields
-	if err := checkCustomTypes(ctx, s.path, moduleName, o.fields); err != nil {
+	if err := checkCustomTypes(ctx, s.path, s.modpath.Package, moduleName, o.fields); err != nil {
 		return sm, err
 	}
-	tFields, err := field.ParseFields(o.fields, checkForbiddenTypeField, signer)
+	tFields, err := parseTypeFields(o)
 	if err != nil {
 		return sm, err
 	}
@@ -175,7 +172,6 @@ func (s Scaffolder) AddType(
 			AppPath:      s.path,
 			ModulePath:   s.modpath.RawPath,
 			ModuleName:   moduleName,
-			OwnerName:    owner(s.modpath.RawPath),
 			TypeName:     name,
 			Fields:       tFields,
 			NoMessage:    o.withoutMessage,
@@ -195,7 +191,6 @@ func (s Scaffolder) AddType(
 			ModulePath: opts.ModulePath,
 			AppName:    opts.AppName,
 			AppPath:    opts.AppPath,
-			OwnerName:  opts.OwnerName,
 		},
 	)
 	if err != nil {
@@ -226,13 +221,13 @@ func (s Scaffolder) AddType(
 	// create the type generator depending on the model
 	switch {
 	case o.isList:
-		g, err = list.NewStargate(tracer, opts)
+		g, err = list.NewGenerator(tracer, opts)
 	case o.isMap:
 		g, err = mapGenerator(tracer, opts, o.indexes)
 	case o.isSingleton:
-		g, err = singleton.NewStargate(tracer, opts)
+		g, err = singleton.NewGenerator(tracer, opts)
 	default:
-		g, err = dry.NewStargate(opts)
+		g, err = dry.NewGenerator(opts)
 	}
 	if err != nil {
 		return sm, err
@@ -245,25 +240,25 @@ func (s Scaffolder) AddType(
 		return sm, err
 	}
 
-	return sm, finish(opts.AppPath, s.modpath.RawPath)
+	return sm, finish(ctx, cacheStorage, opts.AppPath, s.modpath.RawPath)
 }
 
-// checkForbiddenTypeIndex returns true if the name is forbidden as a field name
-func checkForbiddenTypeIndex(name string) error {
-	fieldSplit := strings.Split(name, datatype.Separator)
-	if len(fieldSplit) > 1 {
-		name = fieldSplit[0]
-		fieldType := datatype.Name(fieldSplit[1])
-		if f, ok := datatype.SupportedTypes[fieldType]; !ok || f.NonIndex {
-			return fmt.Errorf("invalid index type %s", fieldType)
+// checkForbiddenTypeIndex returns true if the name is forbidden as a index name.
+func checkForbiddenTypeIndex(index string) error {
+	indexSplit := strings.Split(index, datatype.Separator)
+	if len(indexSplit) > 1 {
+		index = indexSplit[0]
+		indexType := datatype.Name(indexSplit[1])
+		if f, ok := datatype.IsSupportedType(indexType); !ok || f.NonIndex {
+			return fmt.Errorf("invalid index type %s", indexType)
 		}
 	}
-	return checkForbiddenTypeField(name)
+	return checkForbiddenTypeField(index)
 }
 
-// checkForbiddenTypeField returns true if the name is forbidden as a field name
-func checkForbiddenTypeField(name string) error {
-	mfName, err := multiformatname.NewName(name)
+// checkForbiddenTypeField returns true if the name is forbidden as a field name.
+func checkForbiddenTypeField(field string) error {
+	mfName, err := multiformatname.NewName(field)
 	if err != nil {
 		return err
 	}
@@ -274,13 +269,26 @@ func checkForbiddenTypeField(name string) error {
 		"params",
 		"appendedvalue",
 		datatype.TypeCustom:
-		return fmt.Errorf("%s is used by type scaffolder", name)
+		return fmt.Errorf("%s is used by type scaffolder", field)
 	}
 
-	return checkGoReservedWord(name)
+	return checkGoReservedWord(field)
 }
 
-// mapGenerator returns the template generator for a map
+// parseTypeFields validates the fields and returns an error if the validation fails.
+func parseTypeFields(opts addTypeOptions) (field.Fields, error) {
+	signer := ""
+	if opts.isList || opts.isMap || opts.isSingleton {
+		if !opts.withoutMessage {
+			signer = opts.signer
+		}
+		return field.ParseFields(opts.fields, checkForbiddenTypeField, signer)
+	}
+	// For simple types, only check if it's a reserved keyword and don't pass a signer.
+	return field.ParseFields(opts.fields, checkGoReservedWord, signer)
+}
+
+// mapGenerator returns the template generator for a map.
 func mapGenerator(replacer placeholder.Replacer, opts *typed.Options, indexes []string) (*genny.Generator, error) {
 	// Parse indexes with the associated type
 	parsedIndexes, err := field.ParseFields(indexes, checkForbiddenTypeIndex)
@@ -300,5 +308,5 @@ func mapGenerator(replacer placeholder.Replacer, opts *typed.Options, indexes []
 	}
 
 	opts.Indexes = parsedIndexes
-	return maptype.NewStargate(replacer, opts)
+	return maptype.NewGenerator(replacer, opts)
 }

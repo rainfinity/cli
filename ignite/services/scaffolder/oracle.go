@@ -4,15 +4,16 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/gobuffalo/genny"
+	"github.com/gobuffalo/genny/v2"
 
-	"github.com/ignite-hq/cli/ignite/pkg/cmdrunner"
-	"github.com/ignite-hq/cli/ignite/pkg/cmdrunner/step"
-	"github.com/ignite-hq/cli/ignite/pkg/gocmd"
-	"github.com/ignite-hq/cli/ignite/pkg/multiformatname"
-	"github.com/ignite-hq/cli/ignite/pkg/placeholder"
-	"github.com/ignite-hq/cli/ignite/pkg/xgenny"
-	"github.com/ignite-hq/cli/ignite/templates/ibc"
+	"github.com/ignite/cli/ignite/pkg/cache"
+	"github.com/ignite/cli/ignite/pkg/cmdrunner"
+	"github.com/ignite/cli/ignite/pkg/cmdrunner/step"
+	"github.com/ignite/cli/ignite/pkg/gocmd"
+	"github.com/ignite/cli/ignite/pkg/multiformatname"
+	"github.com/ignite/cli/ignite/pkg/placeholder"
+	"github.com/ignite/cli/ignite/pkg/xgenny"
+	"github.com/ignite/cli/ignite/templates/ibc"
 )
 
 const (
@@ -28,6 +29,8 @@ type oracleOptions struct {
 }
 
 // newOracleOptions returns a oracleOptions with default options
+//
+// Deprecated: This function is no longer maintained.
 func newOracleOptions() oracleOptions {
 	return oracleOptions{
 		signer: "creator",
@@ -35,6 +38,8 @@ func newOracleOptions() oracleOptions {
 }
 
 // OracleWithSigner provides a custom signer name for the message
+//
+// Deprecated: This function is no longer maintained.
 func OracleWithSigner(signer string) OracleOption {
 	return func(m *oracleOptions) {
 		m.signer = signer
@@ -42,7 +47,11 @@ func OracleWithSigner(signer string) OracleOption {
 }
 
 // AddOracle adds a new BandChain oracle envtest.
+//
+// Deprecated: This function is no longer maintained.
 func (s *Scaffolder) AddOracle(
+	ctx context.Context,
+	cacheStorage cache.Storage,
 	tracer *placeholder.Tracer,
 	moduleName,
 	queryName string,
@@ -94,7 +103,6 @@ func (s *Scaffolder) AddOracle(
 			AppPath:    s.path,
 			ModulePath: s.modpath.RawPath,
 			ModuleName: moduleName,
-			OwnerName:  owner(s.modpath.RawPath),
 			QueryName:  name,
 			MsgSigner:  mfSigner,
 		}
@@ -107,9 +115,10 @@ func (s *Scaffolder) AddOracle(
 	if err != nil {
 		return sm, err
 	}
-	return sm, finish(opts.AppPath, s.modpath.RawPath)
+	return sm, finish(ctx, cacheStorage, opts.AppPath, s.modpath.RawPath)
 }
 
+// Deprecated: This function is no longer maintained.
 func (s Scaffolder) installBandPacket() error {
 	return cmdrunner.New().
 		Run(context.Background(),

@@ -11,9 +11,9 @@ import (
 	"github.com/gorilla/rpc/v2/json2"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/ignite-hq/cli/ignite/pkg/cmdrunner"
-	"github.com/ignite-hq/cli/ignite/pkg/cmdrunner/step"
-	"github.com/ignite-hq/cli/ignite/pkg/nodetime"
+	"github.com/ignite/cli/ignite/pkg/cmdrunner"
+	"github.com/ignite/cli/ignite/pkg/cmdrunner/step"
+	"github.com/ignite/cli/ignite/pkg/nodetime"
 )
 
 // Call calls a method in the ts relayer wrapper lib with args and fills reply from the returned value.
@@ -29,25 +29,25 @@ func Call(ctx context.Context, method string, args, reply interface{}) error {
 		return err
 	}
 
-	resr, resw := io.Pipe()
+	r, w := io.Pipe()
 
-	g := errgroup.Group{}
+	g, ctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
-		defer resw.Close()
+		defer w.Close()
 
 		return cmdrunner.New().Run(
 			ctx,
 			step.New(
 				step.Exec(command[0], command[1:]...),
 				step.Write(req),
-				step.Stdout(resw),
+				step.Stdout(w),
 			),
 		)
 	})
 
 	// regular logs can be printed to the stdout by the other process before a jsonrpc response is emitted.
 	// differentiate both kinds and simulate printing regular logs if there are any.
-	sc := bufio.NewScanner(resr)
+	sc := bufio.NewScanner(r)
 	for sc.Scan() {
 		err = json2.DecodeClientResponse(bytes.NewReader(sc.Bytes()), reply)
 

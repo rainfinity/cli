@@ -2,51 +2,40 @@ package chain
 
 import (
 	"context"
-	"io"
+	"errors"
 	"os"
 	"path/filepath"
 
 	"github.com/go-git/go-git/v5"
-	"github.com/gookit/color"
-	"github.com/tendermint/spn/pkg/chainid"
 
-	"github.com/ignite-hq/cli/ignite/chainconfig"
-	sperrors "github.com/ignite-hq/cli/ignite/errors"
-	"github.com/ignite-hq/cli/ignite/pkg/chaincmd"
-	chaincmdrunner "github.com/ignite-hq/cli/ignite/pkg/chaincmd/runner"
-	"github.com/ignite-hq/cli/ignite/pkg/confile"
-	"github.com/ignite-hq/cli/ignite/pkg/cosmosver"
-	"github.com/ignite-hq/cli/ignite/pkg/repoversion"
-	"github.com/ignite-hq/cli/ignite/pkg/xurl"
+	chainconfig "github.com/ignite/cli/ignite/config/chain"
+	chainconfigv1 "github.com/ignite/cli/ignite/config/chain/v1"
+	"github.com/ignite/cli/ignite/pkg/chaincmd"
+	chaincmdrunner "github.com/ignite/cli/ignite/pkg/chaincmd/runner"
+	"github.com/ignite/cli/ignite/pkg/cliui/colors"
+	uilog "github.com/ignite/cli/ignite/pkg/cliui/log"
+	"github.com/ignite/cli/ignite/pkg/confile"
+	"github.com/ignite/cli/ignite/pkg/cosmosver"
+	"github.com/ignite/cli/ignite/pkg/events"
+	"github.com/ignite/cli/ignite/pkg/repoversion"
+	"github.com/ignite/cli/ignite/pkg/xexec"
+	"github.com/ignite/cli/ignite/pkg/xurl"
 )
 
-var (
-	appBackendSourceWatchPaths = []string{
-		"app",
-		"cmd",
-		"x",
-		"proto",
-		"third_party",
-	}
-
-	errorColor = color.Red.Render
-	infoColor  = color.Yellow.Render
-)
+var appBackendSourceWatchPaths = []string{
+	"app",
+	"cmd",
+	"x",
+	"proto",
+	"third_party",
+}
 
 type version struct {
 	tag  string
 	hash string
 }
 
-type LogLvl int
-
-const (
-	LogSilent LogLvl = iota
-	LogRegular
-	LogVerbose
-)
-
-// Chain provides programatic access and tools for a Cosmos SDK blockchain.
+// Chain provides programmatic access and tools for a Cosmos SDK blockchain.
 type Chain struct {
 	// app holds info about blockchain app.
 	app App
@@ -55,17 +44,13 @@ type Chain struct {
 
 	Version cosmosver.Version
 
-	plugin         Plugin
 	sourceVersion  version
-	logLevel       LogLvl
 	serveCancel    context.CancelFunc
 	serveRefresher chan struct{}
 	served         bool
 
-	// protoBuiltAtLeastOnce indicates that app's proto generation at least made once.
-	protoBuiltAtLeastOnce bool
-
-	stdout, stderr io.Writer
+	ev          events.Bus
+	logOutputer uilog.Outputer
 }
 
 // chainOptions holds user given options that overwrites chain's defaults.
@@ -79,9 +64,12 @@ type chainOptions struct {
 	// keyring backend used by commands if not specified in configuration
 	keyringBackend chaincmd.KeyringBackend
 
-	// isThirdPartyModuleCodegen indicates if proto code generation should be made
-	// for 3rd party modules. SDK modules are also considered as a 3rd party.
-	isThirdPartyModuleCodegenEnabled bool
+	// checkDependencies checks that cached Go dependencies of the chain have not
+	// been modified since they were downloaded.
+	checkDependencies bool
+
+	// printGeneratedPaths prints the output paths of the generated code
+	printGeneratedPaths bool
 
 	// path of a custom config file
 	ConfigFile string
@@ -89,13 +77,6 @@ type chainOptions struct {
 
 // Option configures Chain.
 type Option func(*Chain)
-
-// LogLevel sets logging level.
-func LogLevel(level LogLvl) Option {
-	return func(c *Chain) {
-		c.logLevel = level
-	}
-}
 
 // ID replaces chain's id with given id.
 func ID(id string) Option {
@@ -111,25 +92,47 @@ func HomePath(path string) Option {
 	}
 }
 
-// KeyringBackend specifies the keyring backend to use for the chain command
+// KeyringBackend specifies the keyring backend to use for the chain command.
 func KeyringBackend(keyringBackend chaincmd.KeyringBackend) Option {
 	return func(c *Chain) {
 		c.options.keyringBackend = keyringBackend
 	}
 }
 
-// ConfigFile specifies a custom config file to use
+// ConfigFile specifies a custom config file to use.
 func ConfigFile(configFile string) Option {
 	return func(c *Chain) {
 		c.options.ConfigFile = configFile
 	}
 }
 
-// EnableThirdPartyModuleCodegen enables code generation for third party modules,
-// including the SDK.
-func EnableThirdPartyModuleCodegen() Option {
+// WithOutputer sets the CLI outputer for the chain.
+func WithOutputer(s uilog.Outputer) Option {
 	return func(c *Chain) {
-		c.options.isThirdPartyModuleCodegenEnabled = true
+		c.logOutputer = s
+	}
+}
+
+// CollectEvents collects events from the chain.
+func CollectEvents(ev events.Bus) Option {
+	return func(c *Chain) {
+		c.ev = ev
+	}
+}
+
+// CheckDependencies checks that cached Go dependencies of the chain have not
+// been modified since they were downloaded. Dependencies are checked by
+// running `go mod verify`.
+func CheckDependencies() Option {
+	return func(c *Chain) {
+		c.options.checkDependencies = true
+	}
+}
+
+// PrintGeneratedPaths prints the output paths of the generated code.
+func PrintGeneratedPaths() Option {
+	return func(c *Chain) {
+		c.options.printGeneratedPaths = true
 	}
 }
 
@@ -142,10 +145,7 @@ func New(path string, options ...Option) (*Chain, error) {
 
 	c := &Chain{
 		app:            app,
-		logLevel:       LogSilent,
 		serveRefresher: make(chan struct{}, 1),
-		stdout:         io.Discard,
-		stderr:         io.Discard,
 	}
 
 	// Apply the options
@@ -153,13 +153,8 @@ func New(path string, options ...Option) (*Chain, error) {
 		apply(c)
 	}
 
-	if c.logLevel == LogVerbose {
-		c.stdout = os.Stdout
-		c.stderr = os.Stderr
-	}
-
 	c.sourceVersion, err = c.appVersion()
-	if err != nil && err != git.ErrRepositoryNotExists {
+	if err != nil && !errors.Is(err, git.ErrRepositoryNotExists) {
 		return nil, err
 	}
 
@@ -168,18 +163,10 @@ func New(path string, options ...Option) (*Chain, error) {
 		return nil, err
 	}
 
-	if !c.Version.IsFamily(cosmosver.Stargate) {
-		return nil, sperrors.ErrOnlyStargateSupported
-	}
-
-	// initialize the plugin depending on the version of the chain
-	c.plugin = c.pickPlugin()
-
 	return c, nil
 }
 
 func (c *Chain) appVersion() (v version, err error) {
-
 	ver, err := repoversion.Determine(c.app.Path)
 	if err != nil {
 		return version{}, err
@@ -200,13 +187,18 @@ func (c *Chain) RPCPublicAddress() (string, error) {
 		if err != nil {
 			return "", err
 		}
-		rpcAddress = conf.Host.RPC
+		validator := conf.Validators[0]
+		servers, err := validator.GetServers()
+		if err != nil {
+			return "", err
+		}
+		rpcAddress = servers.RPC.Address
 	}
 	return rpcAddress, nil
 }
 
-// ConfigPath returns the config path of the chain
-// Empty string means that the chain has no defined config
+// ConfigPath returns the config path of the chain.
+// Empty string means that the chain has no defined config.
 func (c *Chain) ConfigPath() string {
 	if c.options.ConfigFile != "" {
 		return c.options.ConfigFile
@@ -218,11 +210,11 @@ func (c *Chain) ConfigPath() string {
 	return path
 }
 
-// Config returns the config of the chain
-func (c *Chain) Config() (chainconfig.Config, error) {
+// Config returns the config of the chain.
+func (c *Chain) Config() (*chainconfig.Config, error) {
 	configPath := c.ConfigPath()
 	if configPath == "" {
-		return chainconfig.DefaultConf, nil
+		return chainconfig.DefaultChainConfig(), nil
 	}
 	return chainconfig.ParseFile(configPath)
 }
@@ -248,16 +240,7 @@ func (c *Chain) ID() (string, error) {
 	return c.app.N(), nil
 }
 
-// ChainID returns the default network chain's id.
-func (c *Chain) ChainID() (string, error) {
-	chainID, err := c.ID()
-	if err != nil {
-		return "", err
-	}
-	return chainid.NewGenesisChainID(chainID, 1), nil
-}
-
-// Name returns the chain's name
+// Name returns the chain's name.
 func (c *Chain) Name() string {
 	return c.app.N()
 }
@@ -274,6 +257,17 @@ func (c *Chain) Binary() (string, error) {
 	}
 
 	return c.app.D(), nil
+}
+
+// AbsBinaryPath returns the absolute path to the app's binary.
+// Returned path includes the binary name.
+func (c *Chain) AbsBinaryPath() (string, error) {
+	bin, err := c.Binary()
+	if err != nil {
+		return "", err
+	}
+
+	return xexec.ResolveAbsPath(bin)
 }
 
 // SetHome sets the chain home directory.
@@ -301,18 +295,19 @@ func (c *Chain) Home() (string, error) {
 	return home, nil
 }
 
-// DefaultHome returns the blockchain node's default home dir when not specified in the app
+// DefaultHome returns the blockchain node's default home dir when not specified in the app.
 func (c *Chain) DefaultHome() (string, error) {
 	// check if home is defined in config
-	config, err := c.Config()
+	cfg, err := c.Config()
 	if err != nil {
 		return "", err
 	}
-	if config.Init.Home != "" {
-		return config.Init.Home, nil
+	validator, _ := chainconfig.FirstValidator(cfg)
+	if validator.Home != "" {
+		return validator.Home, nil
 	}
 
-	return c.plugin.Home(), nil
+	return c.appHome(), nil
 }
 
 // DefaultGentxPath returns default gentx.json path of the app.
@@ -371,31 +366,28 @@ func (c *Chain) ClientTOMLPath() (string, error) {
 
 // KeyringBackend returns the keyring backend chosen for the chain.
 func (c *Chain) KeyringBackend() (chaincmd.KeyringBackend, error) {
-	// 1st.
+	// When keyring backend is initialized as a chain
+	// option it overrides any configured backends.
 	if c.options.keyringBackend != "" {
 		return c.options.keyringBackend, nil
 	}
 
-	config, err := c.Config()
+	// Try to get keyring backend from the first configured validator
+	cfg, err := c.Config()
 	if err != nil {
 		return "", err
 	}
 
-	// 2nd.
-	if config.Init.KeyringBackend != "" {
-		return chaincmd.KeyringBackendFromString(config.Init.KeyringBackend)
-	}
-
-	// 3rd.
-	if config.Init.Client != nil {
-		if backend, ok := config.Init.Client["keyring-backend"]; ok {
-			if backendStr, ok := backend.(string); ok {
-				return chaincmd.KeyringBackendFromString(backendStr)
+	validator, _ := chainconfig.FirstValidator(cfg)
+	if validator.Client != nil {
+		if v, ok := validator.Client["keyring-backend"]; ok {
+			if backend, ok := v.(string); ok {
+				return chaincmd.KeyringBackendFromString(backend)
 			}
 		}
 	}
 
-	// 4th.
+	// Try to get keyring backend from client.toml config file
 	configTOMLPath, err := c.ClientTOMLPath()
 	if err != nil {
 		return "", err
@@ -411,11 +403,11 @@ func (c *Chain) KeyringBackend() (chaincmd.KeyringBackend, error) {
 		return chaincmd.KeyringBackendFromString(conf.KeyringBackend)
 	}
 
-	// 5th.
+	// Use test backend as default when none is configured
 	return chaincmd.KeyringBackendTest, nil
 }
 
-// Commands returns the runner execute commands on the chain's binary
+// Commands returns the runner execute commands on the chain's binary.
 func (c *Chain) Commands(ctx context.Context) (chaincmdrunner.Runner, error) {
 	id, err := c.ID()
 	if err != nil {
@@ -432,12 +424,31 @@ func (c *Chain) Commands(ctx context.Context) (chaincmdrunner.Runner, error) {
 		return chaincmdrunner.Runner{}, err
 	}
 
+	// Try to make the binary path absolute. This will also
+	// find the binary path when the Go bin path is not part
+	// of the PATH environment variable.
+	binary = xexec.TryResolveAbsPath(binary)
+
 	backend, err := c.KeyringBackend()
 	if err != nil {
 		return chaincmdrunner.Runner{}, err
 	}
 
-	config, err := c.Config()
+	cfg, err := c.Config()
+	if err != nil {
+		return chaincmdrunner.Runner{}, err
+	}
+
+	servers := chainconfigv1.DefaultServers()
+	if len(cfg.Validators) > 0 {
+		validator, _ := chainconfig.FirstValidator(cfg)
+		servers, err = validator.GetServers()
+		if err != nil {
+			return chaincmdrunner.Runner{}, err
+		}
+	}
+
+	nodeAddr, err := xurl.TCP(servers.RPC.Address)
 	if err != nil {
 		return chaincmdrunner.Runner{}, err
 	}
@@ -446,18 +457,21 @@ func (c *Chain) Commands(ctx context.Context) (chaincmdrunner.Runner, error) {
 		chaincmd.WithChainID(id),
 		chaincmd.WithHome(home),
 		chaincmd.WithVersion(c.Version),
-		chaincmd.WithNodeAddress(xurl.TCP(config.Host.RPC)),
+		chaincmd.WithNodeAddress(nodeAddr),
 		chaincmd.WithKeyringBackend(backend),
 	}
 
 	cc := chaincmd.New(binary, chainCommandOptions...)
 
-	ccrOptions := make([]chaincmdrunner.Option, 0)
-	if c.logLevel == LogVerbose {
-		ccrOptions = append(ccrOptions,
-			chaincmdrunner.Stdout(os.Stdout),
-			chaincmdrunner.Stderr(os.Stderr),
-			chaincmdrunner.DaemonLogPrefix(c.genPrefix(logAppd)),
+	ccrOptions := []chaincmdrunner.Option{}
+
+	// Enable command output only when CLI verbosity is enabled
+	if c.logOutputer != nil && c.logOutputer.Verbosity() == uilog.VerbosityVerbose {
+		out := c.logOutputer.NewOutput(c.app.D(), colors.Cyan)
+		ccrOptions = append(
+			ccrOptions,
+			chaincmdrunner.Stdout(out.Stdout()),
+			chaincmdrunner.Stderr(out.Stderr()),
 		)
 	}
 

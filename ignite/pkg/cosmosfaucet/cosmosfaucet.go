@@ -3,11 +3,13 @@ package cosmosfaucet
 
 import (
 	"context"
+	"errors"
 	"time"
 
+	sdkmath "cosmossdk.io/math"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 
-	chaincmdrunner "github.com/ignite-hq/cli/ignite/pkg/chaincmd/runner"
+	chaincmdrunner "github.com/ignite/cli/ignite/pkg/chaincmd/runner"
 )
 
 const (
@@ -21,18 +23,18 @@ const (
 	// on each request.
 	DefaultAmount = 10000000
 
-	// DefaultMaxAmount specifies the maximum amount that can be tranffered to an
+	// DefaultMaxAmount specifies the maximum amount that can be transferred to an
 	// account in all times.
 	DefaultMaxAmount = 100000000
 
-	// DefaultLimitRefreshWindow specifies the time after which the max amount limit
-	// is refreshed for an account [1 year]
+	// DefaultRefreshWindow specifies the time after which the max amount limit
+	// is refreshed for an account [1 year].
 	DefaultRefreshWindow = time.Hour * 24 * 365
 )
 
 // Faucet represents a faucet.
 type Faucet struct {
-	// runner used to intereact with blockchain's binary to transfer tokens.
+	// runner used to interact with blockchain's binary to transfer tokens.
 	runner chaincmdrunner.Runner
 
 	// chainID is the chain id of the chain that faucet is operating for.
@@ -81,12 +83,12 @@ func Account(name, mnemonic string, coinType string) Option {
 // denom is denomination of the coin to be distributed by the faucet.
 func Coin(amount, maxAmount uint64, denom string) Option {
 	return func(f *Faucet) {
-		f.coins = append(f.coins, sdk.NewCoin(denom, sdk.NewIntFromUint64(amount)))
+		f.coins = append(f.coins, sdk.NewCoin(denom, sdkmath.NewIntFromUint64(amount)))
 		f.coinsMax[denom] = maxAmount
 	}
 }
 
-// RefreshWindow adds the duration to refresh the transfer limit to the faucet
+// RefreshWindow adds the duration to refresh the transfer limit to the faucet.
 func RefreshWindow(refreshWindow time.Duration) Option {
 	return func(f *Faucet) {
 		f.limitRefreshWindow = refreshWindow
@@ -100,7 +102,7 @@ func ChainID(id string) Option {
 	}
 }
 
-// OpenAPI configures how to serve Open API page and and spec.
+// OpenAPI configures how to serve Open API page and spec.
 func OpenAPI(apiAddress string) Option {
 	return func(f *Faucet) {
 		f.openAPIData.APIAddress = apiAddress
@@ -131,7 +133,7 @@ func New(ctx context.Context, ccr chaincmdrunner.Runner, options ...Option) (Fau
 	// import the account if mnemonic is provided.
 	if f.accountMnemonic != "" {
 		_, err := f.runner.AddAccount(ctx, f.accountName, f.accountMnemonic, f.coinType)
-		if err != nil && err != chaincmdrunner.ErrAccountAlreadyExists {
+		if err != nil && !errors.Is(err, chaincmdrunner.ErrAccountAlreadyExists) {
 			return Faucet{}, err
 		}
 	}

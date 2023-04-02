@@ -1,37 +1,48 @@
 package ignitecmd
 
 import (
-	"fmt"
-
 	"github.com/spf13/cobra"
 
-	"github.com/ignite-hq/cli/ignite/pkg/clispinner"
-	"github.com/ignite-hq/cli/ignite/services/chain"
+	"github.com/ignite/cli/ignite/pkg/cliui"
+	"github.com/ignite/cli/ignite/pkg/cliui/icons"
+	"github.com/ignite/cli/ignite/services/chain"
 )
 
 func NewGenerateOpenAPI() *cobra.Command {
-	return &cobra.Command{
-		Use:   "openapi",
-		Short: "Generate generates an OpenAPI spec for your chain from your config.yml",
-		RunE:  generateOpenAPIHandler,
+	c := &cobra.Command{
+		Use:     "openapi",
+		Short:   "OpenAPI spec for your chain",
+		PreRunE: gitChangesConfirmPreRunHandler,
+		RunE:    generateOpenAPIHandler,
 	}
+
+	c.Flags().AddFlagSet(flagSetYes())
+
+	return c
 }
 
-func generateOpenAPIHandler(cmd *cobra.Command, args []string) error {
-	s := clispinner.New().SetText("Generating...")
-	defer s.Stop()
+func generateOpenAPIHandler(cmd *cobra.Command, _ []string) error {
+	session := cliui.New(cliui.StartSpinnerWithText(statusGenerating))
+	defer session.End()
 
-	c, err := newChainWithHomeFlags(cmd)
+	c, err := newChainWithHomeFlags(
+		cmd,
+		chain.WithOutputer(session),
+		chain.CollectEvents(session.EventBus()),
+		chain.PrintGeneratedPaths(),
+	)
 	if err != nil {
 		return err
 	}
 
-	if err := c.Generate(cmd.Context(), chain.GenerateOpenAPI()); err != nil {
+	cacheStorage, err := newCache(cmd)
+	if err != nil {
 		return err
 	}
 
-	s.Stop()
-	fmt.Println("⛏️  Generated OpenAPI spec.")
+	if err := c.Generate(cmd.Context(), cacheStorage, chain.GenerateOpenAPI()); err != nil {
+		return err
+	}
 
-	return nil
+	return session.Println(icons.OK, "Generated OpenAPI spec")
 }
