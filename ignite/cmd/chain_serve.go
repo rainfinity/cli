@@ -81,7 +81,7 @@ production, you may want to run "appd start" manually.
 	return c
 }
 
-func chainServeHandler(cmd *cobra.Command, args []string) error {
+func chainServeHandler(cmd *cobra.Command, _ []string) error {
 	var options []cliui.Option
 
 	// Session must not handle events when the verbosity is the default
@@ -127,6 +127,7 @@ func chainServe(cmd *cobra.Command, session *cliui.Session) error {
 	chainOption := []chain.Option{
 		chain.WithOutputer(session),
 		chain.CollectEvents(session.EventBus()),
+		chain.CheckCosmosSDKVersion(),
 	}
 
 	if flagGetCheckDependencies(cmd) {

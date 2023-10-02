@@ -13,20 +13,21 @@ import (
 	"github.com/pkg/errors"
 	"golang.org/x/mod/modfile"
 
+	"github.com/ignite/cli/ignite/pkg/cosmosver"
 	"github.com/ignite/cli/ignite/pkg/gomodule"
 )
 
 const (
-	cosmosModulePath     = "github.com/cosmos/cosmos-sdk"
-	tendermintModulePath = "github.com/tendermint/tendermint"
+	tendermintModulePath = "github.com/cometbft/cometbft"
 	appFileName          = "app.go"
 	defaultAppFilePath   = "app/" + appFileName
 )
 
-var appImplementation = []string{
+var AppImplementation = []string{
 	"Name",
+	"GetKey",
 	"TxConfig",
-	"InterfaceRegistry",
+	"RegisterAPIRoutes",
 }
 
 // implementation tracks the implementation of an interface for a given struct.
@@ -192,8 +193,8 @@ func IsChainPath(path string) error {
 // ValidateGoMod check if the cosmos-sdk and the tendermint packages are imported.
 func ValidateGoMod(module *modfile.File) error {
 	moduleCheck := map[string]bool{
-		cosmosModulePath:     true,
-		tendermintModulePath: true,
+		cosmosver.CosmosModulePath: true,
+		tendermintModulePath:       true,
 	}
 	for _, r := range module.Require {
 		delete(moduleCheck, r.Mod.Path)
@@ -204,7 +205,7 @@ func ValidateGoMod(module *modfile.File) error {
 	return nil
 }
 
-// FindAppFilePath looks for the app file that implements the interfaces listed in appImplementation.
+// FindAppFilePath looks for the app file that implements the interfaces listed in AppImplementation.
 func FindAppFilePath(chainRoot string) (path string, err error) {
 	var found []string
 
@@ -222,8 +223,7 @@ func FindAppFilePath(chainRoot string) (path string, err error) {
 			return err
 		}
 
-		currFound := findImplementationInFiles([]*ast.File{f}, appImplementation)
-
+		currFound := findImplementationInFiles([]*ast.File{f}, AppImplementation)
 		if len(currFound) > 0 {
 			found = append(found, path)
 		}

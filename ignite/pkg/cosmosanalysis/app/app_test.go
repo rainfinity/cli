@@ -137,6 +137,17 @@ func TestFindRegisteredModules(t *testing.T) {
 			),
 		},
 		{
+			name: "with runtime api routes",
+			path: "testdata/modules/runtime_api_routes",
+			expectedModules: append(
+				basicModules,
+				"github.com/cosmos/cosmos-sdk/x/auth/tx",
+				"github.com/cosmos/cosmos-sdk/client/grpc/tmservice",
+				"github.com/username/test/x/foo",
+				"github.com/cosmos/cosmos-sdk/client/grpc/node",
+			),
+		},
+		{
 			name:            "same file function",
 			path:            "testdata/modules/file_function",
 			expectedModules: basicModules,
@@ -379,7 +390,11 @@ func TestCheckAppWiring(t *testing.T) {
 			name:    "invalid case",
 			appFile: AppMinimalFile,
 			want:    false,
-			err:     errors.New("app.go file cannot be found"),
+		},
+		{
+			name:    "invalid file",
+			appFile: nil,
+			err:     errors.New("expected 'package', found 'EOF'"),
 		},
 	}
 	for _, tt := range tests {
@@ -392,7 +407,7 @@ func TestCheckAppWiring(t *testing.T) {
 			got, err := app.CheckAppWiring(tmpDir)
 			if tt.err != nil {
 				require.Error(t, err)
-				require.Equal(t, tt.err.Error(), err.Error())
+				require.Contains(t, err.Error(), tt.err.Error())
 				return
 			}
 			require.NoError(t, err)

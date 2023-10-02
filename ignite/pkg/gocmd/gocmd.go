@@ -39,6 +39,9 @@ const (
 	// CommandEnv represents go "env" command.
 	CommandEnv = "env"
 
+	// CommandList represents go "list" command.
+	CommandList = "list"
+
 	// EnvGOARCH represents GOARCH variable.
 	EnvGOARCH = "GOARCH"
 	// EnvGOMOD represents GOMOD variable.
@@ -85,7 +88,16 @@ func Fmt(ctx context.Context, path string, options ...exec.Option) error {
 
 // ModTidy runs go mod tidy on path with options.
 func ModTidy(ctx context.Context, path string, options ...exec.Option) error {
-	return exec.Exec(ctx, []string{Name(), CommandMod, CommandModTidy}, append(options, exec.StepOption(step.Workdir(path)))...)
+	return exec.Exec(ctx, []string{Name(), CommandMod, CommandModTidy},
+		append(options,
+			exec.StepOption(step.Workdir(path)),
+			// FIXME(tb) untagged version of ignite/cli triggers a 404 not found when go
+			// mod tidy requests the sumdb, until we understand why, we disable sumdb.
+			// related issue:  https://github.com/golang/go/issues/56174
+			// Also disable Go toolchain download because it doesn't work without a valid
+			// GOSUMDB value: https://go.dev/doc/toolchain#download
+			exec.StepOption(step.Env("GOSUMDB=off", "GOTOOLCHAIN=local+path")),
+		)...)
 }
 
 // ModVerify runs go mod verify on path with options.
@@ -141,6 +153,14 @@ func Install(ctx context.Context, path string, pkgs []string, options ...exec.Op
 	return exec.Exec(ctx, command, append(options, exec.StepOption(step.Workdir(path)))...)
 }
 
+// IsInstallError returns true if err is interpreted as a go install error.
+func IsInstallError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "no required module provides package")
+}
+
 // Get runs go get pkgs on path with options.
 func Get(ctx context.Context, path string, pkgs []string, options ...exec.Option) error {
 	command := []string{
@@ -149,6 +169,22 @@ func Get(ctx context.Context, path string, pkgs []string, options ...exec.Option
 	}
 	command = append(command, pkgs...)
 	return exec.Exec(ctx, command, append(options, exec.StepOption(step.Workdir(path)))...)
+}
+
+// List returns the list of packages in path.
+func List(ctx context.Context, path string, flags []string, options ...exec.Option) ([]string, error) {
+	command := []string{
+		Name(),
+		CommandList,
+	}
+	command = append(command, flags...)
+	var b bytes.Buffer
+	err := exec.Exec(ctx, command,
+		append(options, exec.StepOption(step.Workdir(path)), exec.StepOption(step.Stdout(&b)))...)
+	if err != nil {
+		return nil, err
+	}
+	return strings.Fields(b.String()), nil
 }
 
 // Ldflags returns a combined ldflags set from flags.
